@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compact-tree"
+version = "0.1.0"
+description = "Compact, read-only nested dictionary backed by succinct data structures"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "Andrey Savov", email = "savov@hotmail.com"}
+]
+keywords = ["data-structures", "trie", "louds", "dawg", "compression", "compact-tree"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+dependencies = [
+    "bitarray>=2.0.0",
+    "succinct>=0.1.0",
+    "fsspec>=2021.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/andrey-savov/compact-tree"
+Repository = "https://github.com/andrey-savov/compact-tree"
+Issues = "https://github.com/andrey-savov/compact-tree/issues"
+
+[tool.setuptools]
+py-modules = ["compact_tree"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_compact_tree.py"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["compact_tree"]
+omit = ["test_*.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

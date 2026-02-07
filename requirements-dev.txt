@@ -1,0 +1,8 @@
+# Core dependencies
+bitarray>=2.0.0
+succinct>=0.1.0
+fsspec>=2021.0.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
