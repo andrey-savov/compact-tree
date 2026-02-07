@@ -1,5 +1,6 @@
 import struct
 import typing
+from typing import Optional, Union
 from collections import deque
 
 import fsspec
@@ -16,7 +17,7 @@ class _LOUDS:
     v-th 1-bit (1-based) in the bit string.
     """
 
-    def __init__(self, bv: Poppy, ba: bitarray | None = None) -> None:
+    def __init__(self, bv: Poppy, ba: Optional[bitarray] = None) -> None:
         self._bv = bv
         self._ba: bitarray = ba if ba is not None else bitarray()
 
@@ -112,7 +113,7 @@ class CompactTree:
         louds_bits = bitarray()
         vcol_buf = bytearray()
         elbl_buf = bytearray()
-        queue: deque[dict | None] = deque()
+        queue: deque[Optional[dict]] = deque()
 
         def _emit_children(node: dict) -> None:
             for key in sorted(node.keys(), key=lambda k: key2vid[k]):
@@ -155,7 +156,7 @@ class CompactTree:
     #  Factory: from file / deserialise                                    #
     # ------------------------------------------------------------------ #
 
-    def __init__(self, url: str, storage_options: dict | None = None):
+    def __init__(self, url: str, storage_options: Optional[dict] = None):
         """Deserialise a *CompactTree* from storage."""
         self.fs = fsspec.filesystem(
             url.split("://")[0] if "://" in url else "file",
@@ -190,7 +191,7 @@ class CompactTree:
     #  Serialise (always v2)                                               #
     # ------------------------------------------------------------------ #
 
-    def serialize(self, url: str, storage_options: dict | None = None) -> None:
+    def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
         """Write the tree to *url* in v2 binary format."""
         fs = fsspec.filesystem(
             url.split("://")[0] if "://" in url else "file",
@@ -262,7 +263,7 @@ class CompactTree:
             kid = self.louds.next_sibling(kid)
         return out
 
-    def _find_child(self, kids: list[int], key_vid: int) -> int | None:
+    def _find_child(self, kids: list[int], key_vid: int) -> Optional[int]:
         """Return the LOUDS position of the child whose edge label == *key_vid*."""
         for kid in kids:
             if struct.unpack("<I", self.elbl[(kid - 1) * 4:
