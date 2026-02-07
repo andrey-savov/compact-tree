@@ -14,6 +14,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
+        exclude:
+          # Python 3.8 is EOL and not well supported on newer macOS runners
+          - os: macos-latest
+            python-version: '3.8'
 
     steps:
     - uses: actions/checkout@v4
