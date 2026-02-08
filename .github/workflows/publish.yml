@@ -67,7 +67,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment:
-      name: pypi
+      name: testpypi
       url: https://test.pypi.org/p/savov-compact-tree
     permissions:
       id-token: write
