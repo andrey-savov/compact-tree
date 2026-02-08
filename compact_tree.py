@@ -74,14 +74,14 @@ class CompactTree:
         return buf
 
     @staticmethod
-    def _unpack_strings(mv: memoryview) -> list[str]:
-        """Decode length-prefixed UTF-8 strings from a memoryview."""
+    def _unpack_strings(data: bytes) -> list[str]:
+        """Decode length-prefixed UTF-8 strings from bytes."""
         out: list[str] = []
         off = 0
-        while off < len(mv):
-            ln = struct.unpack("<I", mv[off:off + 4])[0]
+        while off < len(data):
+            ln = struct.unpack("<I", data[off:off + 4])[0]
             off += 4
-            out.append(mv[off:off + ln].tobytes().decode("utf-8"))
+            out.append(data[off:off + ln].decode("utf-8"))
             off += ln
         return out
 
@@ -142,12 +142,12 @@ class CompactTree:
         tree.f = None
         tree.mm = None
         tree._dawg_keys = sorted_keys
-        tree._keys_buf = memoryview(bytes(cls._pack_strings(sorted_keys)))
-        tree.val = memoryview(bytes(cls._pack_strings(unique_vals)))
+        tree._keys_buf = bytes(cls._pack_strings(sorted_keys))
+        tree.val = bytes(cls._pack_strings(unique_vals))
         ba = louds_bits
         tree.louds = _LOUDS(Poppy(ba), ba)
-        tree.vcol = memoryview(bytes(vcol_buf))
-        tree.elbl = memoryview(bytes(elbl_buf))
+        tree.vcol = bytes(vcol_buf)
+        tree.elbl = bytes(elbl_buf)
         tree._key2vid = key2vid
         tree._louds_root_list = tree._list_children(0)
         return tree
@@ -158,33 +158,41 @@ class CompactTree:
 
     def __init__(self, url: str, storage_options: Optional[dict] = None):
         """Deserialise a *CompactTree* from storage."""
-        self.fs = fsspec.filesystem(
-            url.split("://")[0] if "://" in url else "file",
-            **(storage_options or {}),
-        )
-        self.f = self.fs.open(url, "rb")
-        self.mm = memoryview(self.f.read())
-        off = 0
-        magic, ver = struct.unpack("<5sQ", self.mm[off:off + 13])
-        off += 13
-        assert magic == b"CTree" and ver == 2
-        keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
-            "<QQQQQ", self.mm[off:off + 40],
-        )
-        off += 40
-        self._keys_buf = self.mm[off:off + keys_len]
-        off += keys_len
-        self.val = self.mm[off:off + val_len]
-        off += val_len
-        ba = bitarray()
-        ba.frombytes(bytes(self.mm[off:off + louds_len]))
-        off += louds_len
-        self.vcol = self.mm[off:off + vcol_len]
-        off += vcol_len
-        self.elbl = self.mm[off:off + elbl_len]
-        self.louds = _LOUDS(Poppy(ba), ba)
-        self._dawg_keys = self._unpack_strings(self._keys_buf)
-        self._key2vid = {k: i for i, k in enumerate(self._dawg_keys)}
+        from fsspec.core import url_to_fs
+        
+        fs, path = url_to_fs(url, **(storage_options or {}))
+        with fs.open(path, "rb") as f:
+            # Read header
+            magic, ver = struct.unpack("<5sQ", f.read(13))
+            assert magic == b"CTree" and ver == 2
+            
+            # Read section lengths
+            keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
+                "<QQQQQ", f.read(40),
+            )
+            
+            # Read and parse keys section
+            self._keys_buf = f.read(keys_len)
+            self._dawg_keys = self._unpack_strings(self._keys_buf)
+            self._key2vid = {k: i for i, k in enumerate(self._dawg_keys)}
+            
+            # Read values section
+            self.val = f.read(val_len)
+            
+            # Read and parse LOUDS section
+            ba = bitarray()
+            ba.frombytes(f.read(louds_len))
+            self.louds = _LOUDS(Poppy(ba), ba)
+            
+            # Read vcol and elbl sections
+            self.vcol = f.read(vcol_len)
+            self.elbl = f.read(elbl_len)
+        
+        # No file handles kept open
+        self.fs = None
+        self.f = None
+        self.mm = None
+        
         self._louds_root_list = self._list_children(0)
 
     # ------------------------------------------------------------------ #
@@ -193,16 +201,15 @@ class CompactTree:
 
     def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
         """Write the tree to *url* in v2 binary format."""
-        fs = fsspec.filesystem(
-            url.split("://")[0] if "://" in url else "file",
-            **(storage_options or {}),
-        )
+        from fsspec.core import url_to_fs
+        
+        fs, path = url_to_fs(url, **(storage_options or {}))
         keys_bytes = bytes(self._keys_buf)
         val_bytes = bytes(self.val)
         louds_bytes = self.louds._ba.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
-        with fs.open(url, "wb") as f:
+        with fs.open(path, "wb") as f:
             f.write(b"CTree")
             f.write(struct.pack("<Q", 2))
             f.write(struct.pack(
@@ -250,7 +257,11 @@ class CompactTree:
             ln = struct.unpack("<I", self.val[off:off + 4])[0]
             off += 4
             if i == vid:
-                return self.val[off:off + ln].tobytes().decode("utf-8")
+                val_slice = self.val[off:off + ln]
+                # Handle both bytes and memoryview for compatibility
+                if isinstance(val_slice, memoryview):
+                    return val_slice.tobytes().decode("utf-8")
+                return val_slice.decode("utf-8")
             off += ln
         raise IndexError(f"vid {vid} out of range")
 
