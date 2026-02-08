@@ -84,7 +84,7 @@ python -m twine upload --repository testpypi dist/*
 3. Test installation from Test PyPI:
 
 ```bash
-pip install --index-url https://test.pypi.org/simple/ compact-tree
+pip install --index-url https://test.pypi.org/simple/ savov-compact-tree
 ```
 
 ### Production PyPI

@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/compact-tree
+      url: https://pypi.org/p/savov-compact-tree
     permissions:
       id-token: write
     
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://test.pypi.org/p/compact-tree
+      url: https://test.pypi.org/p/savov-compact-tree
     permissions:
       id-token: write
     
