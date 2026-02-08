@@ -67,7 +67,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment:
-      name: testpypi
+      name: pypi
       url: https://test.pypi.org/p/compact-tree
     permissions:
       id-token: write
