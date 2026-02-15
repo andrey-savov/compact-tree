@@ -57,11 +57,11 @@ dict are stored once -- while keeping the trie structure simple.
 ```
 CompactTree
   |
-  +-- louds    : _LOUDS        bit-vector tree topology (Poppy rank/select)
-  +-- elbl     : memoryview    edge labels  (uint32 key ids, 4 bytes per node)
-  +-- vcol     : memoryview    value column (uint32: value id or 0xFFFFFFFF for internal nodes)
-  +-- _keys_buf: memoryview    length-prefixed UTF-8 key strings
-  +-- val      : memoryview    length-prefixed UTF-8 value strings
+  +-- louds    : _LOUDS    bit-vector tree topology (Poppy rank/select)
+  +-- elbl     : bytes     edge labels  (uint32 key ids, 4 bytes per node)
+  +-- vcol     : bytes     value column (uint32: value id or 0xFFFFFFFF for internal nodes)
+  +-- _keys_buf: bytes     length-prefixed UTF-8 key strings
+  +-- val      : bytes     length-prefixed UTF-8 value strings
 ```
 
 Each non-root node `v` (1-indexed) occupies a 4-byte slot at offset
@@ -89,10 +89,25 @@ tree = CompactTree.from_dict({"a": {"x": "1"}, "b": "2"})
 tree["a"]["x"]   # "1"
 tree["b"]        # "2"
 "a" in tree      # True
+len(tree)        # 2
+list(tree)       # ["a", "b"]
+
+# String representations
+str(tree)        # "{'a': {'x': '1'}, 'b': '2'}"
+repr(tree)       # "CompactTree.from_dict({'a': {'x': '1'}, 'b': '2'})"
 
 # Serialise / deserialise
 tree.serialize("tree.ctree")
 tree2 = CompactTree("tree.ctree")
+
+# Gzip compression
+tree.serialize("tree.ctree.gz", storage_options={"compression": "gzip"})
+tree3 = CompactTree("tree.ctree.gz", storage_options={"compression": "gzip"})
+
+# Pickle support
+import pickle
+data = pickle.dumps(tree)
+tree4 = pickle.loads(data)
 
 # Materialise back to plain dict
 tree.to_dict()
