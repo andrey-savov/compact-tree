@@ -149,3 +149,5 @@ Thumbs.db
 # Project-specific
 *.ctree
 tmp_*.ctree
+*.ctree.gz
+tmp_*.ctree.gz

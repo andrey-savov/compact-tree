@@ -1,9 +1,8 @@
+import gzip
 import struct
-import typing
-from typing import Optional, Union
+from typing import Any, BinaryIO, Iterator, Optional
 from collections import deque
 
-import fsspec
 from bitarray import bitarray
 from succinct.poppy import Poppy
 
@@ -21,7 +20,7 @@ class _LOUDS:
         self._bv = bv
         self._ba: bitarray = ba if ba is not None else bitarray()
 
-    def first_child(self, v: int) -> typing.Optional[int]:
+    def first_child(self, v: int) -> Optional[int]:
         if v == 0:
             p = 0
         else:
@@ -30,22 +29,23 @@ class _LOUDS:
             return self._bv.rank(p)
         return None
 
-    def next_sibling(self, v: int) -> typing.Optional[int]:
+    def next_sibling(self, v: int) -> Optional[int]:
         pos = self._bv.select(v - 1)  # position of the 1-bit for node v
         nxt = pos + 1
         if nxt < len(self._bv) and self._bv[nxt]:
             return v + 1
         return None
 
+
 class CompactTree:
     """Compact read-only nested dict backed by LOUDS + DAWG + edge labels.
 
     Two ways to create:
 
-    * ``CompactTree.from_dict(d)`` – build in memory from a Python dict.
-    * ``CompactTree(url)``         – deserialise from storage (v1 or v2).
+    * ``CompactTree.from_dict(d)`` - build in memory from a Python dict.
+    * ``CompactTree(url)``         - deserialize from storage.
 
-    Persist with ``tree.serialize(url)`` (always writes v2).
+    Persist with ``tree.serialize(url)``.
     """
 
     # ------------------------------------------------------------------ #
@@ -53,7 +53,7 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _walk_dict(d: dict, keys_out: set[str],
+    def _walk_dict(d: dict[str, Any], keys_out: set[str],
                    values_out: list[str]) -> None:
         """Recursively collect all keys and leaf values."""
         for k, v in d.items():
@@ -85,12 +85,32 @@ class CompactTree:
             off += ln
         return out
 
+    @staticmethod
+    def _wrap_read_stream(stream: BinaryIO, compression: Optional[str]) -> BinaryIO:
+        """Wrap a file stream with decompression if needed."""
+        if compression == "gzip":
+            return gzip.open(stream, "rb")  # type: ignore[return-value]
+        elif compression is None:
+            return stream
+        else:
+            raise ValueError(f"Unsupported compression: {compression}")
+
+    @staticmethod
+    def _wrap_write_stream(stream: BinaryIO, compression: Optional[str]) -> BinaryIO:
+        """Wrap a file stream with compression if needed."""
+        if compression == "gzip":
+            return gzip.open(stream, "wb", compresslevel=9)  # type: ignore[return-value]
+        elif compression is None:
+            return stream
+        else:
+            raise ValueError(f"Unsupported compression: {compression}")
+
     # ------------------------------------------------------------------ #
     #  Factory: from Python dict                                           #
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CompactTree":
+    def from_dict(cls, data: dict[str, Any]) -> "CompactTree":
         """Build a *CompactTree* entirely in memory from a nested Python dict.
 
         Keys must be strings.  Leaf values are stored as strings (non-string
@@ -115,7 +135,7 @@ class CompactTree:
         elbl_buf = bytearray()
         queue: deque[Optional[dict]] = deque()
 
-        def _emit_children(node: dict) -> None:
+        def _emit_children(node: dict[str, Any]) -> None:
             for key in sorted(node.keys(), key=lambda k: key2vid[k]):
                 louds_bits.append(True)
                 elbl_buf.extend(struct.pack("<I", key2vid[key]))
@@ -153,75 +173,96 @@ class CompactTree:
         return tree
 
     # ------------------------------------------------------------------ #
-    #  Factory: from file / deserialise                                    #
+    #  Factory: from file / deserialize                                  #
     # ------------------------------------------------------------------ #
 
     def __init__(self, url: str, storage_options: Optional[dict] = None):
-        """Deserialise a *CompactTree* from storage."""
+        """Deserialize a *CompactTree* from storage.
+        
+        Args:
+            url: Path or URL to the CompactTree file.
+            storage_options: fsspec options. Set compression='gzip' to read
+                           gzip-compressed files.
+        """
         from fsspec.core import url_to_fs
+
+        opts = storage_options or {}
+        compression = opts.get("compression")
+        fs, path = url_to_fs(url, **opts)
         
-        fs, path = url_to_fs(url, **(storage_options or {}))
-        with fs.open(path, "rb") as f:
-            # Read header
-            magic, ver = struct.unpack("<5sQ", f.read(13))
-            assert magic == b"CTree" and ver == 2
-            
-            # Read section lengths
-            keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
-                "<QQQQQ", f.read(40),
-            )
-            
-            # Read and parse keys section
-            self._keys_buf = f.read(keys_len)
-            self._dawg_keys = self._unpack_strings(self._keys_buf)
-            self._key2vid = {k: i for i, k in enumerate(self._dawg_keys)}
-            
-            # Read values section
-            self.val = f.read(val_len)
-            
-            # Read and parse LOUDS section
-            ba = bitarray()
-            ba.frombytes(f.read(louds_len))
-            self.louds = _LOUDS(Poppy(ba), ba)
-            
-            # Read vcol and elbl sections
-            self.vcol = f.read(vcol_len)
-            self.elbl = f.read(elbl_len)
-        
+        with fs.open(path, "rb") as raw_stream:
+            with self._wrap_read_stream(raw_stream, compression) as f:
+                # Read header
+                magic, ver = struct.unpack("<5sQ", f.read(13))
+                assert magic == b"CTree" and ver == 2
+
+                # Read section lengths
+                keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
+                    "<QQQQQ", f.read(40),
+                )
+
+                # Read and parse keys section
+                self._keys_buf = f.read(keys_len)
+                self._dawg_keys = self._unpack_strings(self._keys_buf)
+                self._key2vid = {k: i for i, k in enumerate(self._dawg_keys)}
+
+                # Read values section
+                self.val = f.read(val_len)
+
+                # Read and parse LOUDS section
+                ba = bitarray()
+                ba.frombytes(f.read(louds_len))
+                self.louds = _LOUDS(Poppy(ba), ba)
+
+                # Read vcol and elbl sections
+                self.vcol = f.read(vcol_len)
+                self.elbl = f.read(elbl_len)
+
         # No file handles kept open
         self.fs = None
         self.f = None
         self.mm = None
-        
+
         self._louds_root_list = self._list_children(0)
 
     # ------------------------------------------------------------------ #
-    #  Serialise (always v2)                                               #
+    #  serialize                                                           #
     # ------------------------------------------------------------------ #
 
     def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
-        """Write the tree to *url* in v2 binary format."""
-        from fsspec.core import url_to_fs
+        """Write the tree to *url* in binary format.
         
-        fs, path = url_to_fs(url, **(storage_options or {}))
+        Args:
+            url: Path or URL where to save the CompactTree.
+            storage_options: fsspec options. Set compression='gzip' to write
+                           gzip-compressed output (level 9).
+        """
+        from fsspec.core import url_to_fs
+
+        opts = storage_options or {}
+        compression = opts.get("compression")
+        fs, path = url_to_fs(url, **opts)
+        
         keys_bytes = bytes(self._keys_buf)
         val_bytes = bytes(self.val)
         louds_bytes = self.louds._ba.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
-        with fs.open(path, "wb") as f:
-            f.write(b"CTree")
-            f.write(struct.pack("<Q", 2))
-            f.write(struct.pack(
-                "<QQQQQ",
-                len(keys_bytes), len(val_bytes), len(louds_bytes),
-                len(vcol_bytes), len(elbl_bytes),
-            ))
-            f.write(keys_bytes)
-            f.write(val_bytes)
-            f.write(louds_bytes)
-            f.write(vcol_bytes)
-            f.write(elbl_bytes)
+        
+        with fs.open(path, "wb") as raw_stream:
+            with self._wrap_write_stream(raw_stream, compression) as f:
+                f.write(b"CTree")
+                f.write(struct.pack("<Q", 2))
+                f.write(struct.pack(
+                    "<QQQQQ",
+                    len(keys_bytes), len(val_bytes), len(louds_bytes),
+                    len(vcol_bytes), len(elbl_bytes),
+                ))
+                f.write(keys_bytes)
+                f.write(val_bytes)
+                f.write(louds_bytes)
+                f.write(vcol_bytes)
+                f.write(elbl_bytes)
 
     # ------------------------------------------------------------------ #
     #  to_dict                                                             #
@@ -291,7 +332,7 @@ class CompactTree:
         return self._vid_to_str(vv)
 
     # ------------------------------------------------------------------ #
-    #  _Node  (nested dict interface for sub-trees)                        #
+    #  _Node  (nested dict interface for sub-trees)                      #
     # ------------------------------------------------------------------ #
 
     class _Node:
@@ -303,7 +344,7 @@ class CompactTree:
             """List all children of the current node."""
             return self.tree._list_children(self.pos)
 
-        def __getitem__(self, key: str) -> typing.Any:
+        def __getitem__(self, key: str) -> Any:
             if key not in self.tree._key2vid:
                 raise KeyError(key)
             kids = self._children()
@@ -312,7 +353,7 @@ class CompactTree:
                 raise KeyError(key)
             return self.tree._resolve(child_pos)
 
-        def __iter__(self) -> typing.Iterator[str]:
+        def __iter__(self) -> Iterator[str]:
             for kid in self._children():
                 kv = struct.unpack("<I", self.tree.elbl[(kid - 1) * 4:
                                                         (kid - 1) * 4 + 4])[0]
@@ -328,11 +369,28 @@ class CompactTree:
         def __len__(self) -> int:
             return len(self._children())
 
+        def __repr__(self) -> str:
+            """Return an interpretable representation of the Node."""
+            # Convert node to dict for repr
+            node_dict = {}
+            for key in self:
+                val = self[key]
+                node_dict[key] = val
+            return repr(node_dict)
+
+        def __str__(self) -> str:
+            """Return a string representation like a Python dict."""
+            node_dict = {}
+            for key in self:
+                val = self[key]
+                node_dict[key] = val
+            return str(node_dict)
+
     # ------------------------------------------------------------------ #
-    #  Mapping-like interface (root level)                                 #
+    #  Mapping-like interface (root level)                               #
     # ------------------------------------------------------------------ #
 
-    def __getitem__(self, key: str) -> typing.Any:
+    def __getitem__(self, key: str) -> Any:
         if key not in self._key2vid:
             raise KeyError(key)
         child_pos = self._find_child(
@@ -342,7 +400,7 @@ class CompactTree:
             raise KeyError(key)
         return self._resolve(child_pos)
 
-    def __iter__(self) -> typing.Iterator[str]:
+    def __iter__(self) -> Iterator[str]:
         for kid in self._louds_root_list:
             kv = struct.unpack("<I", self.elbl[(kid - 1) * 4:
                                                (kid - 1) * 4 + 4])[0]
@@ -358,6 +416,14 @@ class CompactTree:
     def __len__(self) -> int:
         return len(self._louds_root_list)
 
+    def __repr__(self) -> str:
+        """Return an interpretable representation of the CompactTree."""
+        return f"CompactTree.from_dict({self.to_dict()!r})"
+
+    def __str__(self) -> str:
+        """Return a string representation like a Python dict."""
+        return str(self.to_dict())
+
     def close(self) -> None:
         if self.f is not None:
             self.f.close()
@@ -367,3 +433,74 @@ class CompactTree:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def __reduce__(self) -> tuple:
+        """Support pickle by using serialize/deserialize.
+        
+        Returns a tuple (callable, args) where callable(*args) reconstructs the object.
+        """
+        import io
+        buf = io.BytesIO()
+        # Serialize to an in-memory buffer
+        keys_bytes = bytes(self._keys_buf)
+        val_bytes = bytes(self.val)
+        louds_bytes = self.louds._ba.tobytes()
+        vcol_bytes = bytes(self.vcol)
+        elbl_bytes = bytes(self.elbl)
+        
+        buf.write(b"CTree")
+        buf.write(struct.pack("<Q", 2))
+        buf.write(struct.pack(
+            "<QQQQQ",
+            len(keys_bytes), len(val_bytes), len(louds_bytes),
+            len(vcol_bytes), len(elbl_bytes),
+        ))
+        buf.write(keys_bytes)
+        buf.write(val_bytes)
+        buf.write(louds_bytes)
+        buf.write(vcol_bytes)
+        buf.write(elbl_bytes)
+        
+        serialized = buf.getvalue()
+        return (self._unpickle_from_bytes, (serialized,))
+
+    @staticmethod
+    def _unpickle_from_bytes(data: bytes) -> "CompactTree":
+        """Reconstruct CompactTree from serialized bytes (used by pickle)."""
+        import io
+        f = io.BytesIO(data)
+        
+        # Read header
+        magic, ver = struct.unpack("<5sQ", f.read(13))
+        assert magic == b"CTree" and ver == 2
+
+        # Read section lengths
+        keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
+            "<QQQQQ", f.read(40),
+        )
+
+        # Read and parse keys section
+        tree = CompactTree.__new__(CompactTree)
+        tree._keys_buf = f.read(keys_len)
+        tree._dawg_keys = CompactTree._unpack_strings(tree._keys_buf)
+        tree._key2vid = {k: i for i, k in enumerate(tree._dawg_keys)}
+
+        # Read values section
+        tree.val = f.read(val_len)
+
+        # Read and parse LOUDS section
+        ba = bitarray()
+        ba.frombytes(f.read(louds_len))
+        tree.louds = _LOUDS(Poppy(ba), ba)
+
+        # Read vcol and elbl sections
+        tree.vcol = f.read(vcol_len)
+        tree.elbl = f.read(elbl_len)
+
+        # No file handles
+        tree.fs = None
+        tree.f = None
+        tree.mm = None
+
+        tree._louds_root_list = tree._list_children(0)
+        return tree
