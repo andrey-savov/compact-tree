@@ -6,7 +6,9 @@ Currently supported versions for security updates:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.3.x   | :white_check_mark: |
+| 0.2.x   | :white_check_mark: |
+| 0.1.x   | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -28,6 +30,7 @@ This library:
 - Is designed for **read-only** access to data structures
 - Does not execute arbitrary code from serialized files
 - Uses standard Python serialization (struct, bitarray)
+- Supports `pickle` for convenience; **only unpickle data from trusted sources**
 - Supports fsspec for file access (be cautious with remote URLs)
 
 When using `CompactTree` with remote storage:

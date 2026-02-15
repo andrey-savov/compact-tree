@@ -12,13 +12,16 @@ Compact, read-only nested dictionary backed by succinct data structures.
 - **Memory-efficient**: Uses succinct data structures (LOUDS trie + DAWG-style deduplication)
 - **Fast lookups**: O(1) rank/select operations via Poppy bit vectors
 - **Serializable**: Save and load from disk with efficient binary format
+- **Gzip compression**: Optional gzip compression for even smaller files on disk
+- **Pickle support**: Fully serializable via Python's `pickle` module
 - **Read-only**: Optimized for lookup-heavy workloads
 - **Storage-agnostic**: Works with local files and remote storage via `fsspec`
+- **Dict-like interface**: Supports `[]`, `in`, `len()`, iteration, `repr()`, and `str()`
 
 ## Installation
 
 ```bash
-pip install compact-tree
+pip install savov-compact-tree
 ```
 
 Or install from source:
@@ -47,12 +50,27 @@ tree = CompactTree.from_dict({
 print(tree["a"]["x"])   # "1"
 print(tree["b"])        # "3"
 print("a" in tree)      # True
+print(len(tree))        # 2
+print(list(tree))       # ["a", "b"]
+
+# String representations
+print(str(tree))        # {'a': {'x': '1', 'y': '2'}, 'b': '3'}
+print(repr(tree))       # CompactTree.from_dict({'a': {'x': '1', ...}, 'b': '3'})
 
 # Serialize to file
 tree.serialize("tree.ctree")
 
 # Load from file
 loaded_tree = CompactTree("tree.ctree")
+
+# Serialize with gzip compression
+tree.serialize("tree.ctree.gz", storage_options={"compression": "gzip"})
+loaded_gz = CompactTree("tree.ctree.gz", storage_options={"compression": "gzip"})
+
+# Pickle support
+import pickle
+data = pickle.dumps(tree)
+tree2 = pickle.loads(data)
 
 # Convert back to plain dict
 plain_dict = loaded_tree.to_dict()
@@ -93,11 +111,11 @@ Navigation relies on **rank** and **select** queries:
 ```
 CompactTree
   |
-  +-- louds    : _LOUDS        bit-vector tree topology (Poppy rank/select)
-  +-- elbl     : memoryview    edge labels  (uint32 key ids, 4 bytes per node)
-  +-- vcol     : memoryview    value column (uint32: value id or 0xFFFFFFFF for internal nodes)
-  +-- _keys_buf: memoryview    length-prefixed UTF-8 key strings
-  +-- val      : memoryview    length-prefixed UTF-8 value strings
+  +-- louds    : _LOUDS    bit-vector tree topology (Poppy rank/select)
+  +-- elbl     : bytes     edge labels  (uint32 key ids, 4 bytes per node)
+  +-- vcol     : bytes     value column (uint32: value id or 0xFFFFFFFF for internal nodes)
+  +-- _keys_buf: bytes     length-prefixed UTF-8 key strings
+  +-- val      : bytes     length-prefixed UTF-8 value strings
 ```
 
 ## Binary Format (v2)
