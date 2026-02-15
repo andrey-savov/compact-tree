@@ -1,9 +1,7 @@
 import struct
-import typing
-from typing import Optional, Union
+from typing import Any, Iterator, Optional
 from collections import deque
 
-import fsspec
 from bitarray import bitarray
 from succinct.poppy import Poppy
 
@@ -21,7 +19,7 @@ class _LOUDS:
         self._bv = bv
         self._ba: bitarray = ba if ba is not None else bitarray()
 
-    def first_child(self, v: int) -> typing.Optional[int]:
+    def first_child(self, v: int) -> Optional[int]:
         if v == 0:
             p = 0
         else:
@@ -30,7 +28,7 @@ class _LOUDS:
             return self._bv.rank(p)
         return None
 
-    def next_sibling(self, v: int) -> typing.Optional[int]:
+    def next_sibling(self, v: int) -> Optional[int]:
         pos = self._bv.select(v - 1)  # position of the 1-bit for node v
         nxt = pos + 1
         if nxt < len(self._bv) and self._bv[nxt]:
@@ -42,10 +40,10 @@ class CompactTree:
 
     Two ways to create:
 
-    * ``CompactTree.from_dict(d)`` – build in memory from a Python dict.
-    * ``CompactTree(url)``         – deserialise from storage (v1 or v2).
+    * ``CompactTree.from_dict(d)`` - build in memory from a Python dict.
+    * ``CompactTree(url)``         - deserialize from storage.
 
-    Persist with ``tree.serialize(url)`` (always writes v2).
+    Persist with ``tree.serialize(url)``.
     """
 
     # ------------------------------------------------------------------ #
@@ -53,7 +51,7 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _walk_dict(d: dict, keys_out: set[str],
+    def _walk_dict(d: dict[str, Any], keys_out: set[str],
                    values_out: list[str]) -> None:
         """Recursively collect all keys and leaf values."""
         for k, v in d.items():
@@ -90,7 +88,7 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CompactTree":
+    def from_dict(cls, data: dict[str, Any]) -> "CompactTree":
         """Build a *CompactTree* entirely in memory from a nested Python dict.
 
         Keys must be strings.  Leaf values are stored as strings (non-string
@@ -115,7 +113,7 @@ class CompactTree:
         elbl_buf = bytearray()
         queue: deque[Optional[dict]] = deque()
 
-        def _emit_children(node: dict) -> None:
+        def _emit_children(node: dict[str, Any]) -> None:
             for key in sorted(node.keys(), key=lambda k: key2vid[k]):
                 louds_bits.append(True)
                 elbl_buf.extend(struct.pack("<I", key2vid[key]))
@@ -153,11 +151,11 @@ class CompactTree:
         return tree
 
     # ------------------------------------------------------------------ #
-    #  Factory: from file / deserialise                                    #
+    #  Factory: from file / deserialize                                  #
     # ------------------------------------------------------------------ #
 
     def __init__(self, url: str, storage_options: Optional[dict] = None):
-        """Deserialise a *CompactTree* from storage."""
+        """Deserialize a *CompactTree* from storage."""
         from fsspec.core import url_to_fs
         
         fs, path = url_to_fs(url, **(storage_options or {}))
@@ -196,11 +194,11 @@ class CompactTree:
         self._louds_root_list = self._list_children(0)
 
     # ------------------------------------------------------------------ #
-    #  Serialise (always v2)                                               #
+    #  serialize                                                           #
     # ------------------------------------------------------------------ #
 
     def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
-        """Write the tree to *url* in v2 binary format."""
+        """Write the tree to *url* in binary format."""
         from fsspec.core import url_to_fs
         
         fs, path = url_to_fs(url, **(storage_options or {}))
@@ -303,7 +301,7 @@ class CompactTree:
             """List all children of the current node."""
             return self.tree._list_children(self.pos)
 
-        def __getitem__(self, key: str) -> typing.Any:
+        def __getitem__(self, key: str) -> Any:
             if key not in self.tree._key2vid:
                 raise KeyError(key)
             kids = self._children()
@@ -312,7 +310,7 @@ class CompactTree:
                 raise KeyError(key)
             return self.tree._resolve(child_pos)
 
-        def __iter__(self) -> typing.Iterator[str]:
+        def __iter__(self) -> Iterator[str]:
             for kid in self._children():
                 kv = struct.unpack("<I", self.tree.elbl[(kid - 1) * 4:
                                                         (kid - 1) * 4 + 4])[0]
@@ -332,7 +330,7 @@ class CompactTree:
     #  Mapping-like interface (root level)                                 #
     # ------------------------------------------------------------------ #
 
-    def __getitem__(self, key: str) -> typing.Any:
+    def __getitem__(self, key: str) -> Any:
         if key not in self._key2vid:
             raise KeyError(key)
         child_pos = self._find_child(
@@ -342,7 +340,7 @@ class CompactTree:
             raise KeyError(key)
         return self._resolve(child_pos)
 
-    def __iter__(self) -> typing.Iterator[str]:
+    def __iter__(self) -> Iterator[str]:
         for kid in self._louds_root_list:
             kv = struct.unpack("<I", self.elbl[(kid - 1) * 4:
                                                (kid - 1) * 4 + 4])[0]
