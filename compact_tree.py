@@ -433,3 +433,74 @@ class CompactTree:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    def __reduce__(self) -> tuple:
+        """Support pickle by using serialize/deserialize.
+        
+        Returns a tuple (callable, args) where callable(*args) reconstructs the object.
+        """
+        import io
+        buf = io.BytesIO()
+        # Serialize to an in-memory buffer
+        keys_bytes = bytes(self._keys_buf)
+        val_bytes = bytes(self.val)
+        louds_bytes = self.louds._ba.tobytes()
+        vcol_bytes = bytes(self.vcol)
+        elbl_bytes = bytes(self.elbl)
+        
+        buf.write(b"CTree")
+        buf.write(struct.pack("<Q", 2))
+        buf.write(struct.pack(
+            "<QQQQQ",
+            len(keys_bytes), len(val_bytes), len(louds_bytes),
+            len(vcol_bytes), len(elbl_bytes),
+        ))
+        buf.write(keys_bytes)
+        buf.write(val_bytes)
+        buf.write(louds_bytes)
+        buf.write(vcol_bytes)
+        buf.write(elbl_bytes)
+        
+        serialized = buf.getvalue()
+        return (self._unpickle_from_bytes, (serialized,))
+
+    @staticmethod
+    def _unpickle_from_bytes(data: bytes) -> "CompactTree":
+        """Reconstruct CompactTree from serialized bytes (used by pickle)."""
+        import io
+        f = io.BytesIO(data)
+        
+        # Read header
+        magic, ver = struct.unpack("<5sQ", f.read(13))
+        assert magic == b"CTree" and ver == 2
+
+        # Read section lengths
+        keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
+            "<QQQQQ", f.read(40),
+        )
+
+        # Read and parse keys section
+        tree = CompactTree.__new__(CompactTree)
+        tree._keys_buf = f.read(keys_len)
+        tree._dawg_keys = CompactTree._unpack_strings(tree._keys_buf)
+        tree._key2vid = {k: i for i, k in enumerate(tree._dawg_keys)}
+
+        # Read values section
+        tree.val = f.read(val_len)
+
+        # Read and parse LOUDS section
+        ba = bitarray()
+        ba.frombytes(f.read(louds_len))
+        tree.louds = _LOUDS(Poppy(ba), ba)
+
+        # Read vcol and elbl sections
+        tree.vcol = f.read(vcol_len)
+        tree.elbl = f.read(elbl_len)
+
+        # No file handles
+        tree.fs = None
+        tree.f = None
+        tree.mm = None
+
+        tree._louds_root_list = tree._list_children(0)
+        return tree

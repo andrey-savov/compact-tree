@@ -586,5 +586,200 @@ class TestCompression:
             Path(fname).unlink()
 
 
+class TestPickle:
+    """Tests for pickle support."""
+
+    def test_pickle_simple_tree(self):
+        """Test pickling and unpickling a simple tree."""
+        import pickle
+        
+        d = {"a": "1", "b": "2", "c": "3"}
+        tree = CompactTree.from_dict(d)
+        
+        # Pickle and unpickle
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        # Verify contents
+        assert tree2.to_dict() == d
+        assert tree2["a"] == "1"
+        assert tree2["b"] == "2"
+        assert tree2["c"] == "3"
+
+    def test_pickle_nested_tree(self):
+        """Test pickling a nested tree."""
+        import pickle
+        
+        d = {
+            "x": "10",
+            "y": {
+                "z": "20",
+                "w": "30"
+            },
+            "a": "5"
+        }
+        tree = CompactTree.from_dict(d)
+        
+        # Pickle and unpickle
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        # Verify contents
+        assert tree2.to_dict() == d
+        assert tree2["y"]["z"] == "20"
+        assert tree2["y"]["w"] == "30"
+
+    def test_pickle_iteration(self):
+        """Test that iteration works on unpickled tree."""
+        import pickle
+        
+        d = {"a": "1", "b": "2", "c": "3"}
+        tree = CompactTree.from_dict(d)
+        
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        # Test iteration
+        keys = list(tree2)
+        assert keys == ["a", "b", "c"]
+
+    def test_pickle_contains(self):
+        """Test that 'in' operator works on unpickled tree."""
+        import pickle
+        
+        d = {"a": "1", "b": "2"}
+        tree = CompactTree.from_dict(d)
+        
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        # Test contains
+        assert "a" in tree2
+        assert "b" in tree2
+        assert "c" not in tree2
+
+    def test_pickle_len(self):
+        """Test that len() works on unpickled tree."""
+        import pickle
+        
+        d = {"a": "1", "b": "2", "c": "3"}
+        tree = CompactTree.from_dict(d)
+        
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        assert len(tree2) == 3
+
+    def test_pickle_deep_nesting(self):
+        """Test pickling deeply nested structures."""
+        import pickle
+        
+        d = {
+            "level1": {
+                "level2": {
+                    "level3": {
+                        "level4": "deep_value"
+                    }
+                }
+            }
+        }
+        tree = CompactTree.from_dict(d)
+        
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        assert tree2["level1"]["level2"]["level3"]["level4"] == "deep_value"
+
+    def test_pickle_size_efficiency(self):
+        """Test that pickle uses serialize method (compact format)."""
+        import pickle
+        import tempfile
+        
+        d = {"a": "1", "b": {"c": "2", "d": "3"}}
+        tree = CompactTree.from_dict(d)
+        
+        # Get serialized size
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname)
+            serialized_size = Path(fname).stat().st_size
+        finally:
+            Path(fname).unlink()
+        
+        # Get pickle size
+        pickled = pickle.dumps(tree)
+        pickle_size = len(pickled)
+        
+        # Pickle should be close to serialized size (within 2x due to protocol overhead)
+        assert pickle_size < serialized_size * 2.0
+        # And definitely much smaller than if we pickled all attributes separately (which would be ~5x)
+        assert pickle_size < serialized_size * 3.0
+
+    def test_pickle_tree_from_file(self):
+        """Test pickling a tree that was loaded from file."""
+        import pickle
+        
+        d = {"x": "100", "y": {"z": "200"}}
+        tree = CompactTree.from_dict(d)
+        
+        # Save to file and reload
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname)
+            tree2 = CompactTree(fname)
+            
+            # Now pickle the loaded tree
+            pickled = pickle.dumps(tree2)
+            tree3 = pickle.loads(pickled)
+            
+            # Verify it works
+            assert tree3.to_dict() == d
+            assert tree3["y"]["z"] == "200"
+        finally:
+            Path(fname).unlink()
+
+    def test_pickle_empty_tree(self):
+        """Test pickling an empty tree."""
+        import pickle
+        
+        d = {}
+        tree = CompactTree.from_dict(d)
+        
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        assert tree2.to_dict() == {}
+        assert len(tree2) == 0
+
+    def test_pickle_large_tree(self):
+        """Test pickling a larger tree with many keys."""
+        import pickle
+        
+        d = {str(i): str(i * 10) for i in range(100)}
+        tree = CompactTree.from_dict(d)
+        
+        pickled = pickle.dumps(tree)
+        tree2 = pickle.loads(pickled)
+        
+        assert tree2.to_dict() == d
+        assert tree2["50"] == "500"
+        assert len(tree2) == 100
+
+    def test_pickle_protocol_versions(self):
+        """Test that pickling works with different pickle protocols."""
+        import pickle
+        
+        d = {"a": "1", "b": {"c": "2"}}
+        tree = CompactTree.from_dict(d)
+        
+        # Test with different protocols
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+            pickled = pickle.dumps(tree, protocol=protocol)
+            tree2 = pickle.loads(pickled)
+            assert tree2.to_dict() == d
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
