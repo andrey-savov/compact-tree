@@ -439,5 +439,152 @@ class TestSerialize:
             Path(fname).unlink()
 
 
+class TestCompression:
+    """Tests for gzip compression support."""
+
+    def test_gzip_round_trip_flat(self):
+        """Test gzip compression with flat dict."""
+        d = {"hello": "world", "foo": "bar"}
+        ct = CompactTree.from_dict(d)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
+            fname = f.name
+        try:
+            # Serialize with gzip compression
+            ct.serialize(fname, storage_options={"compression": "gzip"})
+            
+            # Deserialize with gzip compression
+            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+                assert ct2["hello"] == "world"
+                assert ct2["foo"] == "bar"
+                assert ct2.to_dict() == d
+        finally:
+            Path(fname).unlink()
+
+    def test_gzip_round_trip_nested(self):
+        """Test gzip compression with nested dict."""
+        d = {"a": {"x": "1", "y": "2"}, "b": {"c": {"d": "deep"}}}
+        ct = CompactTree.from_dict(d)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
+            fname = f.name
+        try:
+            ct.serialize(fname, storage_options={"compression": "gzip"})
+            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+                assert ct2["b"]["c"]["d"] == "deep"
+                assert ct2["a"]["x"] == "1"
+                assert ct2.to_dict() == d
+        finally:
+            Path(fname).unlink()
+
+    def test_gzip_compression_reduces_size(self):
+        """Test that gzip actually compresses the data."""
+        # Create a dict with repetitive data (should compress well)
+        d = {f"key{i}": "same_value_repeated" for i in range(100)}
+        ct = CompactTree.from_dict(d)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname_uncompressed = f.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
+            fname_compressed = f.name
+        
+        try:
+            # Save both compressed and uncompressed
+            ct.serialize(fname_uncompressed)
+            ct.serialize(fname_compressed, storage_options={"compression": "gzip"})
+            
+            size_uncompressed = Path(fname_uncompressed).stat().st_size
+            size_compressed = Path(fname_compressed).stat().st_size
+            
+            # Compressed should be smaller
+            assert size_compressed < size_uncompressed
+        finally:
+            Path(fname_uncompressed).unlink()
+            Path(fname_compressed).unlink()
+
+    def test_wrong_compression_on_load_fails(self):
+        """Test that loading with wrong compression fails cleanly."""
+        d = {"hello": "world"}
+        ct = CompactTree.from_dict(d)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        
+        try:
+            # Save uncompressed
+            ct.serialize(fname)
+            
+            # Try to load as gzip - should fail
+            with pytest.raises((AssertionError, OSError, Exception)):
+                CompactTree(fname, storage_options={"compression": "gzip"})
+        finally:
+            Path(fname).unlink()
+
+    def test_wrong_compression_on_save(self):
+        """Test that invalid compression type is rejected."""
+        d = {"hello": "world"}
+        ct = CompactTree.from_dict(d)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        
+        try:
+            with pytest.raises(ValueError, match="Unsupported compression"):
+                ct.serialize(fname, storage_options={"compression": "invalid"})
+        finally:
+            # Clean up in case file was created
+            if Path(fname).exists():
+                Path(fname).unlink()
+
+    def test_gzip_with_empty_dict(self):
+        """Test gzip compression with empty dict."""
+        d = {}
+        ct = CompactTree.from_dict(d)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
+            fname = f.name
+        try:
+            ct.serialize(fname, storage_options={"compression": "gzip"})
+            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+                assert ct2.to_dict() == d
+                assert len(ct2) == 0
+        finally:
+            Path(fname).unlink()
+
+    def test_gzip_with_large_nested_structure(self):
+        """Test gzip compression with large nested structure."""
+        # Build a complex nested structure
+        d = {}
+        for i in range(10):
+            d[f"level1_{i}"] = {
+                f"level2_{j}": {
+                    f"level3_{k}": f"value_{i}_{j}_{k}"
+                    for k in range(5)
+                }
+                for j in range(5)
+            }
+        
+        ct = CompactTree.from_dict(d)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
+            fname = f.name
+        try:
+            ct.serialize(fname, storage_options={"compression": "gzip"})
+            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+                assert ct2.to_dict() == d
+                # Spot check a few values
+                assert ct2["level1_0"]["level2_0"]["level3_0"] == "value_0_0_0"
+                assert ct2["level1_5"]["level2_3"]["level3_4"] == "value_5_3_4"
+        finally:
+            Path(fname).unlink()
+
+    def test_none_compression_explicit(self):
+        """Test that compression=None works explicitly."""
+        d = {"hello": "world"}
+        ct = CompactTree.from_dict(d)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        try:
+            ct.serialize(fname, storage_options={"compression": None})
+            with CompactTree(fname, storage_options={"compression": None}) as ct2:
+                assert ct2.to_dict() == d
+        finally:
+            Path(fname).unlink()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
