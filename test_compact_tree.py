@@ -781,5 +781,122 @@ class TestPickle:
             assert tree2.to_dict() == d
 
 
+class TestStringRepresentations:
+    """Tests for __str__ and __repr__ methods."""
+
+    def test_repr_simple_tree(self):
+        """Test __repr__ returns interpretable representation."""
+        d = {"a": "1", "b": "2"}
+        tree = CompactTree.from_dict(d)
+        
+        r = repr(tree)
+        assert r.startswith("CompactTree.from_dict(")
+        assert "'a': '1'" in r
+        assert "'b': '2'" in r
+
+    def test_repr_nested_tree(self):
+        """Test __repr__ with nested structure."""
+        d = {"x": "10", "y": {"z": "20"}}
+        tree = CompactTree.from_dict(d)
+        
+        r = repr(tree)
+        assert r.startswith("CompactTree.from_dict(")
+        assert "'x': '10'" in r
+        assert "'y':" in r
+        assert "'z': '20'" in r
+
+    def test_repr_empty_tree(self):
+        """Test __repr__ with empty tree."""
+        tree = CompactTree.from_dict({})
+        
+        r = repr(tree)
+        assert r == "CompactTree.from_dict({})"
+
+    def test_str_simple_tree(self):
+        """Test __str__ returns dict-like representation."""
+        d = {"a": "1", "b": "2"}
+        tree = CompactTree.from_dict(d)
+        
+        s = str(tree)
+        # Should look like a dict
+        assert s == "{'a': '1', 'b': '2'}"
+
+    def test_str_nested_tree(self):
+        """Test __str__ with nested structure."""
+        d = {"x": "10", "y": {"z": "20"}}
+        tree = CompactTree.from_dict(d)
+        
+        s = str(tree)
+        # Should be same as str(dict)
+        assert s == str(d)
+
+    def test_str_empty_tree(self):
+        """Test __str__ with empty tree."""
+        tree = CompactTree.from_dict({})
+        
+        s = str(tree)
+        assert s == "{}"
+
+    def test_repr_evaluable(self):
+        """Test that __repr__ output can be evaluated to recreate tree."""
+        d = {"a": "1", "b": "2"}
+        tree = CompactTree.from_dict(d)
+        
+        r = repr(tree)
+        # Should be able to eval it (in theory, if CompactTree is in scope)
+        assert "CompactTree.from_dict(" in r
+        assert r.endswith(")")
+
+    def test_node_repr(self):
+        """Test __repr__ for _Node."""
+        d = {"a": {"x": "1", "y": "2"}}
+        tree = CompactTree.from_dict(d)
+        
+        node = tree["a"]
+        r = repr(node)
+        # Should show the dict representation
+        assert "'x': '1'" in r
+        assert "'y': '2'" in r
+
+    def test_node_str(self):
+        """Test __str__ for _Node."""
+        d = {"a": {"x": "1", "y": "2"}}
+        tree = CompactTree.from_dict(d)
+        
+        node = tree["a"]
+        s = str(node)
+        # Should look like a dict
+        assert s == "{'x': '1', 'y': '2'}"
+
+    def test_node_nested_repr(self):
+        """Test __repr__ for nested _Node."""
+        d = {"a": {"b": {"c": "3"}}}
+        tree = CompactTree.from_dict(d)
+        
+        node = tree["a"]
+        r = repr(node)
+        assert "'b':" in r
+        assert "'c': '3'" in r
+
+    def test_str_is_dict_like(self):
+        """Test that str(tree) matches str(tree.to_dict())."""
+        d = {"foo": "bar", "baz": {"qux": "quux"}}
+        tree = CompactTree.from_dict(d)
+        
+        # str(tree) should match str of the materialized dict
+        assert str(tree) == str(tree.to_dict())
+
+    def test_repr_different_from_str(self):
+        """Test that __repr__ and __str__ are different."""
+        d = {"a": "1"}
+        tree = CompactTree.from_dict(d)
+        
+        # repr should be CompactTree.from_dict(...)
+        # str should be just the dict
+        assert repr(tree) != str(tree)
+        assert "CompactTree" in repr(tree)
+        assert "CompactTree" not in str(tree)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
