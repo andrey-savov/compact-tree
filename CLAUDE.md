@@ -33,8 +33,23 @@ Navigation relies on **rank** and **select** queries over the bit vector:
 | `first_child(v)` | find the (v-1)-th `0`, move one position right; if that bit is `1`, its rank gives the child node id |
 | `next_sibling(v)` | find the `1`-bit for node v (`select(v-1)`), check the next position; if `1`, sibling is `v+1` |
 
-The `_LOUDS` class wraps a **Poppy** bit vector (from the `succinct` package)
+The `LOUDS` class wraps a **Poppy** bit vector (from the `succinct` package)
 which answers rank/select in O(1) time with small overhead.
+
+### MarisaTrie
+
+`MarisaTrie` is a compact word-to-index mapping built on a LOUDS-encoded trie
+with path compression and minimal perfect hashing (MPH). It provides:
+
+- **Path compression**: single-child edges are merged into one label.
+- **Subtree counting**: enables MPH so every unique word gets a dense index in
+  `[0, N)`.
+- **Reverse lookup**: `restore_key(idx)` recovers the word from its index.
+- **Serialisation**: `to_bytes()` / `from_bytes()` for embedding inside
+  `CompactTree`'s binary format.
+
+`CompactTree` uses two `MarisaTrie` instances -- one for keys and one for
+values -- replacing the earlier length-prefixed UTF-8 buffers.
 
 ### DAWG-style key and value deduplication
 
@@ -42,12 +57,12 @@ A DAWG (Directed Acyclic Word Graph) compresses a dictionary by sharing common
 structure. This project borrows the _deduplication_ idea from DAWGs without
 building a full automaton:
 
-- **Keys** are collected, sorted, and deduplicated into a global vocabulary.
-  Each unique key string is assigned an integer id (`key2vid`). Edge labels in
-  the trie store these integer ids rather than raw strings, so the same key
-  appearing at multiple levels is stored only once.
-- **Values** (leaves) are similarly deduplicated into a value table. Each leaf
-  stores a value id pointing into the table.
+- **Keys** are collected, sorted, and deduplicated via a `MarisaTrie`. Each
+  unique key string is assigned a dense integer id. Edge labels in the trie
+  store these integer ids rather than raw strings, so the same key appearing at
+  multiple levels is stored only once.
+- **Values** (leaves) are similarly deduplicated via a second `MarisaTrie`. Each
+  leaf stores a value id pointing into the trie.
 
 This gives DAWG-like space savings -- repeated keys and values across the nested
 dict are stored once -- while keeping the trie structure simple.
@@ -57,25 +72,29 @@ dict are stored once -- while keeping the trie structure simple.
 ```
 CompactTree
   |
-  +-- louds    : _LOUDS    bit-vector tree topology (Poppy rank/select)
-  +-- elbl     : bytes     edge labels  (uint32 key ids, 4 bytes per node)
-  +-- vcol     : bytes     value column (uint32: value id or 0xFFFFFFFF for internal nodes)
-  +-- _keys_buf: bytes     length-prefixed UTF-8 key strings
-  +-- val      : bytes     length-prefixed UTF-8 value strings
+  +-- louds      : LOUDS       bit-vector tree topology (Poppy rank/select)
+  +-- elbl       : bytes       edge labels  (uint32 key ids, 4 bytes per node)
+  +-- vcol       : bytes       value column (uint32: value id or 0xFFFFFFFF for internal nodes)
+  +-- _key_trie  : MarisaTrie  key vocabulary (word <-> dense index)
+  +-- _val_trie  : MarisaTrie  value vocabulary (word <-> dense index)
 ```
 
 Each non-root node `v` (1-indexed) occupies a 4-byte slot at offset
 `(v-1)*4` in both `elbl` (its edge label / key id) and `vcol` (its value id
 or the sentinel `0xFFFFFFFF` for internal nodes).
 
-## Binary format (v2)
+## Binary format (v3)
 
 ```
 Magic   : 5 bytes   "CTree"
-Version : 8 bytes   uint64 LE (always 2)
+Version : 8 bytes   uint64 LE (always 3)
 Header  : 5 x 8 bytes  lengths of: keys, values, louds, vcol, elbl
 Payload : keys_bytes | val_bytes | louds_bytes | vcol_bytes | elbl_bytes
 ```
+
+`keys_bytes` and `val_bytes` are serialised `MarisaTrie` instances (see
+`MarisaTrie.to_bytes()`). `louds_bytes` is the raw bitarray, `vcol_bytes` and
+`elbl_bytes` are packed uint32 arrays.
 
 ## Usage
 

@@ -9,7 +9,7 @@ Compact, read-only nested dictionary backed by succinct data structures.
 
 ## Features
 
-- **Memory-efficient**: Uses succinct data structures (LOUDS trie + DAWG-style deduplication)
+- **Memory-efficient**: Uses succinct data structures (LOUDS trie + MarisaTrie deduplication)
 - **Fast lookups**: O(1) rank/select operations via Poppy bit vectors
 - **Serializable**: Save and load from disk with efficient binary format
 - **Gzip compression**: Optional gzip compression for even smaller files on disk
@@ -99,10 +99,18 @@ Navigation relies on **rank** and **select** queries:
 | `first_child(v)` | Find the (v-1)-th `0`, check next position       |
 | `next_sibling(v)` | Find the `1`-bit for node v, check next position |
 
+### MarisaTrie
+
+`MarisaTrie` is a compact word-to-index mapping built on a LOUDS-encoded trie with path compression and minimal perfect hashing (MPH). `CompactTree` uses two `MarisaTrie` instances -- one for keys and one for values -- to provide DAWG-style deduplication.
+
+- **Path compression**: single-child edges are merged for compactness
+- **Dense indexing**: every unique word gets an index in `[0, N)`
+- **Reverse lookup**: recover the original word from its index
+
 ### DAWG-Style Deduplication
 
-- **Keys** are collected, sorted, and deduplicated into a global vocabulary
-- **Values** (leaves) are similarly deduplicated into a value table
+- **Keys** are collected, sorted, and deduplicated via a `MarisaTrie`
+- **Values** (leaves) are similarly deduplicated via a second `MarisaTrie`
 - Edge labels store integer IDs rather than raw strings
 - Same key/value appearing multiple times is stored only once
 
@@ -111,21 +119,23 @@ Navigation relies on **rank** and **select** queries:
 ```
 CompactTree
   |
-  +-- louds    : _LOUDS    bit-vector tree topology (Poppy rank/select)
-  +-- elbl     : bytes     edge labels  (uint32 key ids, 4 bytes per node)
-  +-- vcol     : bytes     value column (uint32: value id or 0xFFFFFFFF for internal nodes)
-  +-- _keys_buf: bytes     length-prefixed UTF-8 key strings
-  +-- val      : bytes     length-prefixed UTF-8 value strings
+  +-- louds      : LOUDS       bit-vector tree topology (Poppy rank/select)
+  +-- elbl       : bytes       edge labels  (uint32 key ids, 4 bytes per node)
+  +-- vcol       : bytes       value column (uint32: value id or 0xFFFFFFFF for internal nodes)
+  +-- _key_trie  : MarisaTrie  key vocabulary (word <-> dense index)
+  +-- _val_trie  : MarisaTrie  value vocabulary (word <-> dense index)
 ```
 
-## Binary Format (v2)
+## Binary Format (v3)
 
 ```
 Magic   : 5 bytes   "CTree"
-Version : 8 bytes   uint64 LE (always 2)
+Version : 8 bytes   uint64 LE (always 3)
 Header  : 5 x 8 bytes  lengths of: keys, values, louds, vcol, elbl
 Payload : keys_bytes | val_bytes | louds_bytes | vcol_bytes | elbl_bytes
 ```
+
+`keys_bytes` and `val_bytes` are serialised `MarisaTrie` instances. `louds_bytes` is the raw bitarray, `vcol_bytes` and `elbl_bytes` are packed uint32 arrays.
 
 ## Dependencies
 
@@ -136,7 +146,7 @@ Payload : keys_bytes | val_bytes | louds_bytes | vcol_bytes | elbl_bytes
 ## Testing
 
 ```bash
-pytest test_compact_tree.py
+pytest test_compact_tree.py test_marisa_trie.py
 ```
 
 ## Contributing

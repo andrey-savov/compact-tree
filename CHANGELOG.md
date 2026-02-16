@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-02-15
+
+### Added
+
+- `MarisaTrie` implementation: compact word-to-index mapping with LOUDS topology, path compression, and minimal perfect hashing (MPH)
+- `MarisaTrie` serialization (`to_bytes()` / `from_bytes()`, `serialize()` / `load()`) and pickle support
+- `MarisaTrie` gzip compression support via `storage_options`
+- Tests for `MarisaTrie` (construction, lookup, reverse lookup, serialization, compression, pickle)
+- Tests for unsupported compression in `CompactTree` and `MarisaTrie` serialization and loading
+
+### Changed
+
+- Refactored `CompactTree` to use `MarisaTrie` for key and value management, replacing length-prefixed UTF-8 buffers
+- Binary format upgraded from v2 to v3 (keys and values are now serialised `MarisaTrie` instances)
+- Refactored `LOUDS` from private `_LOUDS` class to public `LOUDS` class in its own module
+
 ## [0.3.0] - 2026-02-15
 
 ### Added
@@ -57,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - succinct >= 0.0.7
 - fsspec >= 2021.0.0
 
-[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/andrey-savov/compact-tree/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/andrey-savov/compact-tree/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/andrey-savov/compact-tree/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/andrey-savov/compact-tree/releases/tag/v0.1.0

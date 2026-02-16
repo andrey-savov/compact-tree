@@ -53,7 +53,7 @@ pip install -e ".[dev]"
 After building, you can install the wheel locally to test:
 
 ```bash
-pip install dist/savov_compact_tree-0.3.0-py3-none-any.whl
+pip install dist/savov_compact_tree-1.0.0-py3-none-any.whl
 ```
 
 Or test in a fresh virtual environment:
@@ -64,7 +64,7 @@ python -m venv test-env
 source test-env/bin/activate  # On Windows: test-env\Scripts\activate
 
 # Install the built package
-pip install dist/savov_compact_tree-0.3.0-py3-none-any.whl
+pip install dist/savov_compact_tree-1.0.0-py3-none-any.whl
 
 # Test it
 python -c "from compact_tree import CompactTree; print('✅ Import successful!')"
@@ -165,7 +165,7 @@ Update version in `pyproject.toml` before building:
 
 ```toml
 [project]
-version = "0.3.1"  # Increment for new release
+version = "1.0.0"  # Increment for new release
 ```
 
 Follow [Semantic Versioning](https://semver.org/):

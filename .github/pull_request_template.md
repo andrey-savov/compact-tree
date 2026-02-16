@@ -29,7 +29,7 @@ Fixes #
 
 **Test command:**
 ```bash
-pytest test_compact_tree.py -v
+pytest test_compact_tree.py test_marisa_trie.py -v
 ```
 
 ## Checklist

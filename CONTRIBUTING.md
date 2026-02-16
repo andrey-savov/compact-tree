@@ -28,7 +28,7 @@ Thank you for your interest in contributing to compact-tree! This document provi
 
 2. **Make your changes** and ensure they follow the project's coding style
 
-3. **Write or update tests** to cover your changes in `test_compact_tree.py`
+3. **Write or update tests** to cover your changes in `test_compact_tree.py` and/or `test_marisa_trie.py`
 
 4. **Run the test suite** to ensure everything passes:
    ```bash
@@ -76,7 +76,7 @@ All contributions should include tests:
 
 Run tests with:
 ```bash
-pytest test_compact_tree.py -v
+pytest test_compact_tree.py test_marisa_trie.py -v
 ```
 
 ## Submitting Changes
