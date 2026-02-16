@@ -44,7 +44,7 @@ Repository = "https://github.com/andrey-savov/compact-tree"
 Issues = "https://github.com/andrey-savov/compact-tree/issues"
 
 [tool.setuptools]
-py-modules = ["compact_tree", "louds.py", "marisa_trie"]
+py-modules = ["compact_tree", "louds", "marisa_trie"]
 
 [tool.pytest.ini_options]
 testpaths = ["test_compact_tree.py", "test_marisa_trie.py"]

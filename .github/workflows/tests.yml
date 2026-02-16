@@ -30,7 +30,7 @@ jobs:
     
     - name: Run tests
       run: |
-        pytest test_compact_tree.py -v --cov=compact_tree --cov-report=xml --cov-report=term
+        pytest test_compact_tree.py test_marisa_trie.py -v --cov=compact_tree --cov=louds --cov=marisa_trie --cov-report=xml --cov-report=term
     
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
