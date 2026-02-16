@@ -6,6 +6,7 @@ Currently supported versions for security updates:
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 1.1.x   | :white_check_mark: |
 | 1.0.x   | :white_check_mark: |
 | 0.3.x   | :x:                |
 | 0.2.x   | :x:                |

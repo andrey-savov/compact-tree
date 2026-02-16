@@ -3,7 +3,7 @@
 import gzip
 import struct
 from typing import BinaryIO, Iterable, Optional
-from collections import deque
+from collections import deque, OrderedDict
 
 from bitarray import bitarray
 from succinct.poppy import Poppy
@@ -45,8 +45,11 @@ class MarisaTrie:
             self._labels = b""
             self._terminal = bitarray()
             self._counts = b""
+            self._label_offsets = []
             self._tail_trie: Optional[MarisaTrie] = None
             self._root_is_terminal = False
+            self._index_cache: OrderedDict[str, int] = OrderedDict()
+            self._cache_size = 4096
             return
         
         # Build intermediate trie structure
@@ -54,6 +57,10 @@ class MarisaTrie:
         
         # Check if root is terminal (empty string in trie)
         self._root_is_terminal = "" in root
+        
+        # Initialize LRU cache for lookups
+        self._index_cache: OrderedDict[str, int] = OrderedDict()
+        self._cache_size = 4096
         
         # Apply path compression and convert to LOUDS
         self._build_louds(root)
@@ -91,9 +98,16 @@ class MarisaTrie:
         # We'll build a list of nodes in LOUDS order
         nodes_metadata: list = []
         
+        # Track parent-child relationships for efficient count computation
+        # children_map[parent_idx] = [child_idx1, child_idx2, ...]
+        children_map: dict[int, list[int]] = {}
+        next_node_idx = 0
+        
         # BFS to build LOUDS topology and collect node metadata
-        def _emit_children(inode: dict) -> None:
+        def _emit_children(inode: dict, parent_idx: int) -> None:
             """Emit children of an intermediate node, applying path compression."""
+            nonlocal next_node_idx
+            
             children = [(k, v) for k, v in inode.items() if k != ""]
             
             if not children:
@@ -101,6 +115,7 @@ class MarisaTrie:
                 louds_bits.append(False)
                 return
             
+            child_indices = []
             for char, child_node in children:
                 # Apply path compression: if child has exactly one non-terminal child,
                 # merge the edge labels
@@ -124,59 +139,68 @@ class MarisaTrie:
                 # Emit the compressed edge
                 louds_bits.append(True)
                 is_terminal = "" in current
+                child_idx = next_node_idx
+                next_node_idx += 1
+                child_indices.append(child_idx)
                 nodes_metadata.append((current, label, is_terminal))
-                node_queue.append(current)
+                node_queue.append((current, child_idx))
             
+            # Store children relationship
+            children_map[parent_idx] = child_indices
             louds_bits.append(False)
         
-        # Emit root's children
-        _emit_children(root)
+        # Emit root's children (parent is -1 for root)
+        _emit_children(root, -1)
         
         # Process queue
         while node_queue:
-            node = node_queue.popleft()
-            _emit_children(node)
+            node, parent_idx = node_queue.popleft()
+            _emit_children(node, parent_idx)
         
-        # Pack labels (length-prefixed UTF-8 per node)
+        # Pack labels (length-prefixed UTF-8 per node) and build offset index
+        label_offsets = []
+        offset = 0
         for _, label, _ in nodes_metadata:
             label_bytes = label.encode("utf-8")
+            label_offsets.append(offset)
             labels_buf.extend(struct.pack("<I", len(label_bytes)))
             labels_buf.extend(label_bytes)
+            offset = len(labels_buf)
         
         # Terminal bits (one per node, aligned with nodes_metadata)
         for _, _, is_term in nodes_metadata:
             terminal_bits.append(is_term)
         
-        # Store LOUDS and labels
+        # Store LOUDS, labels, and label offsets
         self._louds = LOUDS(Poppy(louds_bits), louds_bits)
         self._labels = bytes(labels_buf)
         self._terminal = terminal_bits
+        self._label_offsets = label_offsets  # For O(1) label access
         
-        # Compute subtree counts bottom-up
-        self._compute_counts()
+        # Compute subtree counts bottom-up using direct child relationships
+        self._compute_counts_optimized(children_map)
         
         # No tail trie for now (simplified - full recursive MARISA not implemented)
         self._tail_trie = None
 
-    def _compute_counts(self) -> None:
-        """Compute subtree word counts for each node (bottom-up)."""
+    def _compute_counts_optimized(self, children_map: dict[int, list[int]]) -> None:
+        """Compute subtree word counts for each node (bottom-up) using direct child mapping.
+        
+        Args:
+            children_map: Mapping from parent node index to list of child indices.
+        """
         num_nodes = len(self._terminal)
         counts = [0] * num_nodes
         
-        # Bottom-up traversal: process nodes in reverse LOUDS order
+        # Bottom-up traversal: process nodes in reverse order
         for node_idx in range(num_nodes - 1, -1, -1):
-            # Node indices are 1-based in LOUDS, but _terminal is 0-indexed
-            louds_node = node_idx + 1
-            
             # Count starts with 1 if terminal
             count = 1 if self._terminal[node_idx] else 0
             
-            # Add counts from all children
-            child = self._louds.first_child(louds_node)
-            while child is not None:
-                child_idx = child - 1  # Convert to 0-indexed
-                count += counts[child_idx]
-                child = self._louds.next_sibling(child)
+            # Add counts from all children using direct mapping
+            if node_idx in children_map:
+                for child_idx in children_map[node_idx]:
+                    count += counts[child_idx]
             
             counts[node_idx] = count
         
@@ -202,6 +226,25 @@ class MarisaTrie:
         Raises:
             KeyError: If word is not in the trie.
         """
+        # Check cache first
+        if word in self._index_cache:
+            # Move to end (most recently used)
+            self._index_cache.move_to_end(word)
+            return self._index_cache[word]
+        
+        # Compute index (fallthrough to existing logic)
+        result = self._index_uncached(word)
+        
+        # Add to cache (with LRU eviction)
+        self._index_cache[word] = result
+        if len(self._index_cache) > self._cache_size:
+            # Remove least recently used (first item)
+            self._index_cache.popitem(last=False)
+        
+        return result
+    
+    def _index_uncached(self, word: str) -> int:
+        """Uncached implementation of index lookup."""
         if self._n == 0:
             raise KeyError(word)
         
@@ -336,14 +379,10 @@ class MarisaTrie:
 
     def _get_label(self, node_idx: int) -> str:
         """Get the edge label for a node (0-indexed)."""
-        offset = 0
-        for i in range(node_idx + 1):
-            length = struct.unpack("<I", self._labels[offset:offset + 4])[0]
-            offset += 4
-            if i == node_idx:
-                return self._labels[offset:offset + length].decode("utf-8")
-            offset += length
-        return ""
+        # Use pre-computed offsets for O(1) access
+        offset = self._label_offsets[node_idx]
+        length = struct.unpack("<I", self._labels[offset:offset + 4])[0]
+        return self._labels[offset + 4:offset + 4 + length].decode("utf-8")
 
     def _get_count(self, node_idx: int) -> int:
         """Get the subtree word count for a node (0-indexed)."""
@@ -483,6 +522,21 @@ class MarisaTrie:
         
         trie._counts = counts_bytes
         trie._tail_trie = None
+        
+        # Reconstruct label offsets from labels_bytes
+        trie._label_offsets = []
+        offset = 0
+        num_labels = len(terminal_ba)  # One label per terminal bit
+        for i in range(num_labels):
+            trie._label_offsets.append(offset)
+            if offset >= len(labels_bytes):
+                break
+            length = struct.unpack("<I", labels_bytes[offset:offset + 4])[0]
+            offset += 4 + length
+        
+        # Initialize LRU cache
+        trie._index_cache = OrderedDict()
+        trie._cache_size = 4096
         
         return trie
 

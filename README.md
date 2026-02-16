@@ -11,6 +11,7 @@ Compact, read-only nested dictionary backed by succinct data structures.
 
 - **Memory-efficient**: Uses succinct data structures (LOUDS trie + MarisaTrie deduplication)
 - **Fast lookups**: O(1) rank/select operations via Poppy bit vectors
+- **High-performance builds**: LRU-cached MarisaTrie lookups and O(1) label access for 183x faster construction with key reuse
 - **Serializable**: Save and load from disk with efficient binary format
 - **Gzip compression**: Optional gzip compression for even smaller files on disk
 - **Pickle support**: Fully serializable via Python's `pickle` module
@@ -148,6 +149,16 @@ Payload : keys_bytes | val_bytes | louds_bytes | vcol_bytes | elbl_bytes
 ```bash
 pytest test_compact_tree.py test_marisa_trie.py
 ```
+
+### Benchmarks
+
+Run performance benchmarks with `pytest-benchmark`:
+
+```bash
+pytest test_compact_tree.py::TestLoadPerformance --benchmark-only -v
+```
+
+See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for detailed results and [OPTIMIZATIONS.md](OPTIMIZATIONS.md) for optimization history.
 
 ## Contributing
 

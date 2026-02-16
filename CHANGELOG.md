@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-02-15
+
+### Added
+
+- LRU cache for `MarisaTrie.index()` lookups with 4,096 entry limit (Optimization #4)
+- Pre-computed label offsets array for O(1) label access in `MarisaTrie` (Optimization #3)
+- Key lookup caching in `CompactTree._emit_children()` to eliminate redundant trie traversals (Optimization #2)
+- Optimized count computation using children_map instead of LOUDS navigation (Optimization #1)
+- Comprehensive benchmarking infrastructure with `pytest-benchmark`
+- Load testing with co-occurrence dictionaries from text corpus
+- Profiling scripts: `profile_marisa.py`, `profile_compact_tree.py`
+- Documentation: `OPTIMIZATIONS.md` with detailed performance analysis
+- Benchmark runner: `run_benchmarks.py` with JSON/markdown output
+
+### Changed
+
+- `MarisaTrie.index()` now uses instance-level LRU cache via `OrderedDict`
+- `MarisaTrie._get_label()` complexity reduced from O(n) to O(1)
+- `MarisaTrie._compute_counts()` replaced with `_compute_counts_optimized()` using direct child mapping
+
+### Performance
+
+- **183x faster** build time for co-occurrence dictionaries (5.3s → 0.029s for 37K entries)
+- **99.91% cache hit rate** for typical workloads with key reuse
+- 84x speedup from LRU cache alone
+- 8x faster label access with pre-computed offsets
+- 34% reduction in MarisaTrie lookups via key caching
+
 ## [1.0.0] - 2026-02-15
 
 ### Added
@@ -73,7 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - succinct >= 0.0.7
 - fsspec >= 2021.0.0
 
-[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/andrey-savov/compact-tree/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/andrey-savov/compact-tree/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/andrey-savov/compact-tree/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/andrey-savov/compact-tree/compare/v0.1.0...v0.2.0
