@@ -78,6 +78,16 @@ class TestMarisaTrie:
         
         with pytest.raises(KeyError):
             _ = trie[""]
+        
+        # Test prefix of existing word that's not in trie
+        trie2 = MarisaTrie(["foobar"])
+        with pytest.raises(KeyError):
+            _ = trie2["foo"]  # Prefix exists in trie structure but not terminal
+        
+        # Test extension of existing word
+        trie3 = MarisaTrie(["foo"])
+        with pytest.raises(KeyError):
+            _ = trie3["foobar"]  # Would go past the terminal
 
     def test_len(self):
         """Test __len__ matches unique word count."""
@@ -106,6 +116,12 @@ class TestMarisaTrie:
         # Should be able to get index for empty string
         idx = trie[""]
         assert 0 <= idx < 3
+        
+        # Should be able to restore empty string
+        assert trie.restore_key(idx) == ""
+        
+        # Test __getitem__ for empty string returns same as index()
+        assert trie[""] == trie.index("")
 
     def test_shared_prefixes(self):
         """Test words with shared prefixes."""
@@ -121,6 +137,10 @@ class TestMarisaTrie:
         # Indices should be dense
         indices = {trie[w] for w in words}
         assert indices == set(range(5))
+        
+        # Test that non-existent words are not found
+        assert "abcd" not in trie  # Extension of existing word
+        assert "ac" not in trie    # Not a valid path
 
 
 class TestRestoreKey:
@@ -165,6 +185,14 @@ class TestRestoreKey:
         
         with pytest.raises(IndexError):
             trie.restore_key(0)
+
+    def test_restore_key_only_empty_string(self):
+        """Test restore_key when trie contains only empty string."""
+        trie = MarisaTrie([""])
+        
+        assert len(trie) == 1
+        assert trie.restore_key(0) == ""
+        assert trie[""] == 0
 
     def test_restore_key_complex(self):
         """Test restore_key with complex word set."""
@@ -261,6 +289,38 @@ class TestCompression:
         finally:
             Path(tmp_path).unlink()
 
+    def test_unsupported_compression_serialize(self):
+        """Test that unsupported compression raises error on serialize."""
+        trie = MarisaTrie(["foo", "bar"])
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mtrie") as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            with pytest.raises(ValueError, match="Unsupported compression"):
+                trie.serialize(tmp_path, storage_options={"compression": "bzip2"})
+        finally:
+            # Clean up if file was created
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink()
+
+    def test_unsupported_compression_load(self):
+        """Test that unsupported compression raises error on load."""
+        trie = MarisaTrie(["foo", "bar"])
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mtrie") as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            # First serialize normally
+            trie.serialize(tmp_path)
+            
+            # Try to load with unsupported compression
+            with pytest.raises(ValueError, match="Unsupported compression"):
+                MarisaTrie.load(tmp_path, storage_options={"compression": "bzip2"})
+        finally:
+            Path(tmp_path).unlink()
+
 
 class TestPickle:
     """Tests for pickle support."""
@@ -325,6 +385,21 @@ class TestEdgeCases:
         assert len(trie) == 5
         indices = {trie[w] for w in words}
         assert indices == set(range(5))
+        
+        # Test lookups that don't exist
+        with pytest.raises(KeyError):
+            _ = trie["f"]
+        with pytest.raises(KeyError):
+            _ = trie["ab"]
+
+    def test_only_empty_string(self):
+        """Test trie with only empty string."""
+        trie = MarisaTrie([""])
+        
+        assert len(trie) == 1
+        assert "" in trie
+        assert trie[""] == 0
+        assert trie.restore_key(0) == ""
 
     def test_long_words(self):
         """Test trie with long words."""
@@ -357,6 +432,12 @@ class TestEdgeCases:
             assert word in trie
             idx = trie[word]
             assert trie.restore_key(idx) == word
+        
+        # Test lookups that should fail
+        with pytest.raises(KeyError):
+            _ = trie["ab"]  # Prefix not in trie
+        with pytest.raises(KeyError):
+            _ = trie["abcd"]  # Between two compressed paths
 
     def test_many_words(self):
         """Test trie with many words."""

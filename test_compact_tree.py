@@ -555,6 +555,39 @@ class TestCompression:
         finally:
             Path(fname).unlink()
 
+    def test_unsupported_compression_serialize(self):
+        """Test that unsupported compression raises error on serialize."""
+        d = {"foo": "bar"}
+        ct = CompactTree.from_dict(d)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        
+        try:
+            with pytest.raises(ValueError, match="Unsupported compression"):
+                ct.serialize(fname, storage_options={"compression": "bzip2"})
+        finally:
+            if Path(fname).exists():
+                Path(fname).unlink()
+
+    def test_unsupported_compression_load(self):
+        """Test that unsupported compression raises error on load."""
+        d = {"foo": "bar"}
+        ct = CompactTree.from_dict(d)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        
+        try:
+            # Serialize normally first
+            ct.serialize(fname)
+            
+            # Try to load with unsupported compression
+            with pytest.raises(ValueError, match="Unsupported compression"):
+                CompactTree(fname, storage_options={"compression": "bzip2"})
+        finally:
+            Path(fname).unlink()
+
 
 class TestPickle:
     """Tests for pickle support."""
