@@ -6,18 +6,19 @@ from pathlib import Path
 import pytest
 from bitarray import bitarray
 
-from compact_tree import CompactTree, _LOUDS
+from louds import LOUDS
+from compact_tree import CompactTree
 from succinct.poppy import Poppy
 
 
-class Test_LOUDS:
-    """Tests for the _LOUDS class."""
+class TestLOUDS:
+    """Tests for the LOUDS class."""
 
     def test_louds_first_child_root(self):
         """Test first_child on root node."""
         # Create a simple bit vector: 1 (root has child)
         ba = bitarray('1')
-        louds = _LOUDS(Poppy(ba))
+        louds = LOUDS(Poppy(ba))
         
         child = louds.first_child(0)
         assert child == 1
@@ -26,7 +27,7 @@ class Test_LOUDS:
         """Test first_child when node has no children."""
         # Create bit vector: 10 (root has child, that child has no children)
         ba = bitarray('10')
-        louds = _LOUDS(Poppy(ba))
+        louds = LOUDS(Poppy(ba))
         
         child = louds.first_child(0)
         assert child == 1
@@ -39,7 +40,7 @@ class Test_LOUDS:
         """Test next_sibling navigation."""
         # Create bit vector with multiple siblings: 11 (two children of root)
         ba = bitarray('11')
-        louds = _LOUDS(Poppy(ba))
+        louds = LOUDS(Poppy(ba))
         
         # First child exists
         child1 = louds.first_child(0)
@@ -52,7 +53,7 @@ class Test_LOUDS:
     def test_louds_no_next_sibling(self):
         """Test next_sibling returns None when at end."""
         ba = bitarray('10')
-        louds = _LOUDS(Poppy(ba))
+        louds = LOUDS(Poppy(ba))
         
         child = louds.first_child(0)
         assert child == 1
@@ -66,7 +67,7 @@ class Test_LOUDS:
         # Build a simple tree with root having 2 children
         # Bit sequence: 11
         ba = bitarray('11')
-        louds = _LOUDS(Poppy(ba))
+        louds = LOUDS(Poppy(ba))
 
         # Root has 2 children
         assert louds.first_child(0) == 1
@@ -79,7 +80,7 @@ class TestCompactTreeNode:
         """Test _Node._children method with real LOUDS."""
         # Create a LOUDS with 3 children
         louds_bits = bitarray('111')
-        louds = _LOUDS(Poppy(louds_bits))
+        louds = LOUDS(Poppy(louds_bits))
         
         # Get children of root
         children = []
@@ -94,7 +95,7 @@ class TestCompactTreeNode:
     def test_node_contains_key(self):
         """Test _Node.__contains__ logic."""
         louds_bits = bitarray('11')  # Root with 2 children
-        louds = _LOUDS(Poppy(louds_bits))
+        louds = LOUDS(Poppy(louds_bits))
         
         # Get children
         children = []
@@ -147,10 +148,10 @@ class TestCompactTree:
         """Test LOUDS select_zero operation."""
         # Create bit vector with known select_zero positions
         ba = bitarray('1001')  # Two 0s at positions 1 and 2
-        louds = _LOUDS(Poppy(ba))
+        louds = LOUDS(Poppy(ba))
         
         # Poppy should work with select operations
-        assert isinstance(louds, _LOUDS)
+        assert isinstance(louds, LOUDS)
 
     def test_vid_to_str_with_real_memoryview_data(self):
         """Test _vid_to_str directly with real memoryview data."""
@@ -189,7 +190,7 @@ class TestCompactTree:
         
         # Create LOUDS with root having 3 children
         louds_bits = bitarray('111')
-        louds = _LOUDS(Poppy(louds_bits))
+        louds = LOUDS(Poppy(louds_bits))
         tree.louds = louds
         
         children = tree._list_children(0)
@@ -200,7 +201,7 @@ class TestCompactTree:
         """Test enumerating root children with LOUDS."""
         # Create LOUDS with 2 root children
         louds_bits = bitarray('11')
-        louds = _LOUDS(Poppy(louds_bits))
+        louds = LOUDS(Poppy(louds_bits))
         
         children = []
         kid = louds.first_child(0)
@@ -214,7 +215,7 @@ class TestCompactTree:
     def test_louds_no_children(self):
         """Test node with no children."""
         louds_bits = bitarray('10')  # Root has child, but child has no children
-        louds = _LOUDS(Poppy(louds_bits))
+        louds = LOUDS(Poppy(louds_bits))
         
         # Root has 1 child
         child = louds.first_child(0)

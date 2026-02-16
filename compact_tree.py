@@ -6,35 +6,9 @@ from collections import deque
 from bitarray import bitarray
 from succinct.poppy import Poppy
 
+from louds import LOUDS
+
 _INTERNAL = 0xFFFFFFFF  # vcol sentinel for internal (non-leaf) nodes
-
-
-class _LOUDS:
-    """LOUDS (Level-Order Unary Degree Sequence) trie built on a Poppy bit vector.
-
-    Node 0 is the root.  Every other node v (≥ 1) corresponds to the
-    v-th 1-bit (1-based) in the bit string.
-    """
-
-    def __init__(self, bv: Poppy, ba: Optional[bitarray] = None) -> None:
-        self._bv = bv
-        self._ba: bitarray = ba if ba is not None else bitarray()
-
-    def first_child(self, v: int) -> Optional[int]:
-        if v == 0:
-            p = 0
-        else:
-            p = self._bv.select_zero(v - 1) + 1
-        if p < len(self._bv) and self._bv[p]:
-            return self._bv.rank(p)
-        return None
-
-    def next_sibling(self, v: int) -> Optional[int]:
-        pos = self._bv.select(v - 1)  # position of the 1-bit for node v
-        nxt = pos + 1
-        if nxt < len(self._bv) and self._bv[nxt]:
-            return v + 1
-        return None
 
 
 class CompactTree:
@@ -165,7 +139,7 @@ class CompactTree:
         tree._keys_buf = bytes(cls._pack_strings(sorted_keys))
         tree.val = bytes(cls._pack_strings(unique_vals))
         ba = louds_bits
-        tree.louds = _LOUDS(Poppy(ba), ba)
+        tree.louds = LOUDS(Poppy(ba), ba)
         tree.vcol = bytes(vcol_buf)
         tree.elbl = bytes(elbl_buf)
         tree._key2vid = key2vid
@@ -212,7 +186,7 @@ class CompactTree:
                 # Read and parse LOUDS section
                 ba = bitarray()
                 ba.frombytes(f.read(louds_len))
-                self.louds = _LOUDS(Poppy(ba), ba)
+                self.louds = LOUDS(Poppy(ba), ba)
 
                 # Read vcol and elbl sections
                 self.vcol = f.read(vcol_len)
@@ -491,7 +465,7 @@ class CompactTree:
         # Read and parse LOUDS section
         ba = bitarray()
         ba.frombytes(f.read(louds_len))
-        tree.louds = _LOUDS(Poppy(ba), ba)
+        tree.louds = LOUDS(Poppy(ba), ba)
 
         # Read vcol and elbl sections
         tree.vcol = f.read(vcol_len)
