@@ -109,9 +109,11 @@ class CompactTree:
         queue: deque[Optional[dict]] = deque()
 
         def _emit_children(node: dict[str, Any]) -> None:
-            for key in sorted(node.keys(), key=lambda k: key_trie[k]):
+            # Cache key lookups to avoid repeated MarisaTrie traversals
+            key_indices = {k: key_trie[k] for k in node.keys()}
+            for key in sorted(node.keys(), key=lambda k: key_indices[k]):
                 louds_bits.append(True)
-                elbl_buf.extend(struct.pack("<I", key_trie[key]))
+                elbl_buf.extend(struct.pack("<I", key_indices[key]))
                 child = node[key]
                 if isinstance(child, dict):
                     vcol_buf.extend(struct.pack("<I", _INTERNAL))

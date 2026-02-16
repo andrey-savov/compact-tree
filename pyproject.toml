@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "savov-compact-tree"
-version = "1.0.0"
+version = "1.1.0"
 description = "Compact, read-only nested dictionary backed by succinct data structures"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,6 +36,9 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pytest-benchmark>=4.0.0",
+    "memory-profiler>=0.60.0",
+    "requests>=2.28.0",
 ]
 
 [project.urls]
@@ -64,3 +67,4 @@ exclude_lines = [
     "raise NotImplementedError",
     "if __name__ == .__main__.:",
 ]
+

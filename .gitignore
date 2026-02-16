@@ -151,3 +151,4 @@ Thumbs.db
 tmp_*.ctree
 *.ctree.gz
 tmp_*.ctree.gz
+.benchmarks/

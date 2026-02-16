@@ -910,5 +910,195 @@ class TestStringRepresentations:
         assert "CompactTree" not in str(tree)
 
 
+class TestLoadPerformance:
+    """Load tests with large co-occurrence dictionaries.
+    
+    These tests benchmark CompactTree with realistic large datasets.
+    Run with: pytest test_compact_tree.py::TestLoadPerformance --benchmark-only
+    """
+
+    @pytest.fixture(scope="class")
+    def corpus_data(self):
+        """Load and parse corpus for all tests in this class."""
+        from pathlib import Path
+        from download_large_corpus import load_and_parse_corpus, get_fallback_corpus
+        
+        # Try to use cached large corpus, fall back to corpus.txt
+        cache_path = Path(__file__).parent / "large_corpus_small.txt"
+        
+        try:
+            if cache_path.exists():
+                parsed, metadata = load_and_parse_corpus(cache_path)
+            else:
+                # Use fallback (duplicated corpus.txt)
+                parsed, metadata = get_fallback_corpus()
+        except Exception:
+            # Last resort: just use corpus.txt once
+            corpus_path = Path(__file__).parent / "corpus.txt"
+            parsed, metadata = load_and_parse_corpus(corpus_path)
+        
+        return parsed, metadata
+
+    @pytest.fixture(scope="class")
+    def cooccurrence_dict(self, corpus_data):
+        """Build co-occurrence dictionary from corpus."""
+        from build_cooccurrence import build_simple_cooccurrence_dict
+        
+        parsed, _ = corpus_data
+        # Use small vocab for reasonable test time (50 words ~=  30K entries)
+        cooccur_dict, metadata = build_simple_cooccurrence_dict(parsed, max_words=50)
+        
+        return cooccur_dict, metadata
+
+    def test_corpus_loads(self, corpus_data):
+        """Verify corpus loads correctly."""
+        parsed, metadata = corpus_data
+        
+        assert len(parsed) > 0, "Should have paragraphs"
+        assert metadata["unique_words"] > 100, "Should have substantial vocabulary"
+        
+        print(f"\nCorpus: {metadata['unique_words']} unique words, "
+              f"{metadata['sentences']} sentences")
+
+    def test_cooccurrence_dict_builds(self, cooccurrence_dict):
+        """Verify co-occurrence dict builds correctly."""
+        cooccur, metadata = cooccurrence_dict
+        
+        assert len(cooccur) > 0, "Should have level 1 keys"
+        assert metadata["total_entries"] > 0, "Should have leaf entries"
+        
+        print(f"\nCo-occurrence: {metadata['level1_keys']} L1 keys, "
+              f"{metadata['total_entries']} total entries")
+
+    def test_build_compact_tree_from_cooccurrence(self, benchmark, cooccurrence_dict):
+        """Benchmark building CompactTree from large co-occurrence dict."""
+        cooccur, metadata = cooccurrence_dict
+        
+        # Benchmark the build
+        tree = benchmark(CompactTree.from_dict, cooccur)
+        
+        # Verify it built correctly
+        assert len(tree) == len(cooccur)
+        
+        # Store metadata for reporting
+        benchmark.extra_info = {
+            "input_keys": metadata["level1_keys"],
+            "total_entries": metadata["total_entries"],
+            "vocabulary": metadata["vocabulary_size"],
+        }
+
+    def test_tree_lookups_at_different_depths(self, benchmark, cooccurrence_dict):
+        """Benchmark lookups at different depths in the tree."""
+        import random
+        
+        cooccur, _ = cooccurrence_dict
+        tree = CompactTree.from_dict(cooccur)
+        
+        # Collect sample paths at different depths
+        level1_keys = list(cooccur.keys())[:10]
+        level2_paths = []
+        level3_paths = []
+        
+        for k1 in level1_keys:
+            if k1 in tree:
+                level2 = tree[k1]
+                if isinstance(level2, CompactTree):
+                    k2_list = list(level2.keys())[:5]
+                    for k2 in k2_list:
+                        level2_paths.append((k1, k2))
+                        if k2 in level2:
+                            level3 = level2[k2]
+                            if isinstance(level3, CompactTree):
+                                k3_list = list(level3.keys())[:3]
+                                for k3 in k3_list:
+                                    level3_paths.append((k1, k2, k3))
+        
+        # Benchmark mixed lookups
+        def do_lookups():
+            # Level 1 lookups
+            for k1 in level1_keys[:5]:
+                _ = tree[k1]
+            
+            # Level 2 lookups
+            for k1, k2 in level2_paths[:10]:
+                _ = tree[k1][k2]
+            
+            # Level 3 lookups
+            for k1, k2, k3 in level3_paths[:10]:
+                _ = tree[k1][k2][k3]
+        
+        benchmark(do_lookups)
+        
+        benchmark.extra_info = {
+            "level1_lookups": min(5, len(level1_keys)),
+            "level2_lookups": min(10, len(level2_paths)),
+            "level3_lookups": min(10, len(level3_paths)),
+        }
+
+    def test_serialization_performance(self, benchmark, cooccurrence_dict, tmp_path):
+        """Benchmark serialization to disk."""
+        cooccur, metadata = cooccurrence_dict
+        tree = CompactTree.from_dict(cooccur)
+        
+        output_path = tmp_path / "benchmark_tree.ctree"
+        
+        # Benchmark serialization
+        benchmark(tree.serialize, str(output_path))
+        
+        # Check file size
+        import os
+        file_size = os.path.getsize(output_path)
+        
+        benchmark.extra_info = {
+            "file_size_bytes": file_size,
+            "file_size_kb": file_size / 1024,
+            "input_entries": metadata["total_entries"],
+            "compression_none": True,
+        }
+
+    def test_deserialization_performance(self, benchmark, cooccurrence_dict, tmp_path):
+        """Benchmark deserialization from disk."""
+        cooccur, _ = cooccurrence_dict
+        tree = CompactTree.from_dict(cooccur)
+        
+        output_path = tmp_path / "benchmark_tree.ctree"
+        tree.serialize(str(output_path))
+        
+        # Benchmark deserialization
+        loaded_tree = benchmark(CompactTree, str(output_path))
+        
+        # Verify correctness
+        assert len(loaded_tree) == len(tree)
+
+    @pytest.mark.skipif(
+        not pytest.importorskip("memory_profiler", reason="memory_profiler not installed"),
+        reason="Requires memory_profiler"
+    )
+    def test_memory_usage(self, cooccurrence_dict):
+        """Measure memory usage during tree construction."""
+        from memory_profiler import memory_usage
+        
+        cooccur, metadata = cooccurrence_dict
+        
+        # Measure memory during build
+        def build_tree():
+            return CompactTree.from_dict(cooccur)
+        
+        mem_usage = memory_usage(build_tree, interval=0.01, include_children=False)
+        
+        peak_mb = max(mem_usage)
+        baseline_mb = min(mem_usage)
+        delta_mb = peak_mb - baseline_mb
+        
+        print(f"\nMemory usage: baseline={baseline_mb:.1f}MB, "
+              f"peak={peak_mb:.1f}MB, delta={delta_mb:.1f}MB")
+        print(f"Entries: {metadata['total_entries']}")
+        print(f"Memory per entry: {(delta_mb * 1024) / metadata['total_entries']:.2f} KB")
+        
+        # Memory usage should be reasonable (less than 100MB for thousands of entries)
+        assert delta_mb < 100, f"Memory usage too high: {delta_mb:.1f}MB"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
