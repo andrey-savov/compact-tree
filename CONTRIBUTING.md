@@ -79,6 +79,22 @@ Run tests with:
 pytest test_compact_tree.py test_marisa_trie.py -v
 ```
 
+### Performance Benchmarks
+
+For changes that affect build or lookup performance, run the benchmark suite:
+
+```bash
+pytest test_compact_tree.py::TestLoadPerformance --benchmark-only -v
+```
+
+Compare against previous results to check for regressions:
+
+```bash
+pytest test_compact_tree.py::TestLoadPerformance --benchmark-only --benchmark-compare
+```
+
+See [OPTIMIZATIONS.md](OPTIMIZATIONS.md) for guidelines on profiling and benchmarking.
+
 ## Submitting Changes
 
 1. **Push your changes** to your fork:

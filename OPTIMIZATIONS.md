@@ -298,5 +298,3 @@ After any optimization:
 - [ ] Serialization round-trip works
 - [ ] Memory usage is acceptable
 - [ ] No regression on edge cases (empty, single-entry, deep nesting)
-- [ ] Memory usage is acceptable
-- [ ] No regression on edge cases (empty, single-entry, deep nesting)

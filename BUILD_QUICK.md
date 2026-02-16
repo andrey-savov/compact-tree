@@ -11,7 +11,7 @@
 
 ```powershell
 # Install in a test environment
-pip install dist\savov_compact_tree-1.0.0-py3-none-any.whl
+pip install dist\savov_compact_tree-1.1.0-py3-none-any.whl
 
 # Or install in editable mode for development
 pip install -e .
