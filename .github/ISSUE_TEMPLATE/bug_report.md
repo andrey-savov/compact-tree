@@ -35,7 +35,7 @@ Error message or unexpected output here
 ## Environment
 - **OS**: [e.g., Windows 11, Ubuntu 22.04, macOS 13]
 - **Python Version**: [e.g., 3.11.2]
-- **compact-tree Version**: [e.g., 0.1.0]
+- **compact-tree Version**: [e.g., 1.0.0]
 - **Installation Method**: [pip, source, etc.]
 
 ## Dependencies
