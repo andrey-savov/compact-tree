@@ -240,6 +240,7 @@ class MarisaTrie:
                     # Add counts of all previous siblings
                     sibling = self._louds.first_child(node)
                     while sibling != child:
+                        assert sibling is not None  # Won't be None since child exists
                         sibling_idx = sibling - 1
                         idx += self._get_count(sibling_idx)
                         sibling = self._louds.next_sibling(sibling)

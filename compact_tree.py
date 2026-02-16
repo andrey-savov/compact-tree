@@ -7,6 +7,7 @@ from bitarray import bitarray
 from succinct.poppy import Poppy
 
 from louds import LOUDS
+from marisa_trie import MarisaTrie
 
 _INTERNAL = 0xFFFFFFFF  # vcol sentinel for internal (non-leaf) nodes
 
@@ -95,13 +96,11 @@ class CompactTree:
         all_values: list[str] = []
         cls._walk_dict(data, all_keys, all_values)
 
-        # 2. Sorted, deduplicated key list
-        sorted_keys = sorted(all_keys)
-        key2vid: dict[str, int] = {k: i for i, k in enumerate(sorted_keys)}
+        # 2. Build MarisaTrie for keys (deduplicated)
+        key_trie = MarisaTrie(all_keys)
 
-        # 3. Value table (length-prefixed UTF-8 strings, deduplicated)
-        unique_vals = list(dict.fromkeys(all_values))
-        val2vid = {v: i for i, v in enumerate(unique_vals)}
+        # 3. Build MarisaTrie for values (deduplicated)
+        val_trie = MarisaTrie(all_values)
 
         # 4. BFS -> LOUDS bits + vcol + elbl
         louds_bits = bitarray()
@@ -110,15 +109,15 @@ class CompactTree:
         queue: deque[Optional[dict]] = deque()
 
         def _emit_children(node: dict[str, Any]) -> None:
-            for key in sorted(node.keys(), key=lambda k: key2vid[k]):
+            for key in sorted(node.keys(), key=lambda k: key_trie[k]):
                 louds_bits.append(True)
-                elbl_buf.extend(struct.pack("<I", key2vid[key]))
+                elbl_buf.extend(struct.pack("<I", key_trie[key]))
                 child = node[key]
                 if isinstance(child, dict):
                     vcol_buf.extend(struct.pack("<I", _INTERNAL))
                     queue.append(child)
                 else:
-                    vcol_buf.extend(struct.pack("<I", val2vid[str(child)]))
+                    vcol_buf.extend(struct.pack("<I", val_trie[str(child)]))
                     queue.append(None)          # leaf placeholder
             louds_bits.append(False)
 
@@ -135,14 +134,12 @@ class CompactTree:
         tree.fs = None
         tree.f = None
         tree.mm = None
-        tree._dawg_keys = sorted_keys
-        tree._keys_buf = bytes(cls._pack_strings(sorted_keys))
-        tree.val = bytes(cls._pack_strings(unique_vals))
+        tree._key_trie = key_trie
+        tree._val_trie = val_trie
         ba = louds_bits
         tree.louds = LOUDS(Poppy(ba), ba)
         tree.vcol = bytes(vcol_buf)
         tree.elbl = bytes(elbl_buf)
-        tree._key2vid = key2vid
         tree._louds_root_list = tree._list_children(0)
         return tree
 
@@ -168,20 +165,20 @@ class CompactTree:
             with self._wrap_read_stream(raw_stream, compression) as f:
                 # Read header
                 magic, ver = struct.unpack("<5sQ", f.read(13))
-                assert magic == b"CTree" and ver == 2
+                assert magic == b"CTree" and ver == 3
 
                 # Read section lengths
                 keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
                     "<QQQQQ", f.read(40),
                 )
 
-                # Read and parse keys section
-                self._keys_buf = f.read(keys_len)
-                self._dawg_keys = self._unpack_strings(self._keys_buf)
-                self._key2vid = {k: i for i, k in enumerate(self._dawg_keys)}
+                # Read and parse keys MarisaTrie
+                keys_bytes = f.read(keys_len)
+                self._key_trie = MarisaTrie.from_bytes(keys_bytes)
 
-                # Read values section
-                self.val = f.read(val_len)
+                # Read values MarisaTrie
+                val_bytes = f.read(val_len)
+                self._val_trie = MarisaTrie.from_bytes(val_bytes)
 
                 # Read and parse LOUDS section
                 ba = bitarray()
@@ -217,8 +214,8 @@ class CompactTree:
         compression = opts.get("compression")
         fs, path = url_to_fs(url, **opts)
         
-        keys_bytes = bytes(self._keys_buf)
-        val_bytes = bytes(self.val)
+        keys_bytes = self._key_trie.to_bytes()
+        val_bytes = self._val_trie.to_bytes()
         louds_bytes = self.louds._ba.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
@@ -226,7 +223,7 @@ class CompactTree:
         with fs.open(path, "wb") as raw_stream:
             with self._wrap_write_stream(raw_stream, compression) as f:
                 f.write(b"CTree")
-                f.write(struct.pack("<Q", 2))
+                f.write(struct.pack("<Q", 3))
                 f.write(struct.pack(
                     "<QQQQQ",
                     len(keys_bytes), len(val_bytes), len(louds_bytes),
@@ -250,14 +247,14 @@ class CompactTree:
                 kv = struct.unpack(
                     "<I", self.elbl[(kid - 1) * 4:(kid - 1) * 4 + 4],
                 )[0]
-                key = self._dawg_keys[kv]
+                key = self._key_trie.restore_key(kv)
                 vv = struct.unpack(
                     "<I", self.vcol[(kid - 1) * 4:(kid - 1) * 4 + 4],
                 )[0]
                 if vv == _INTERNAL:
                     out[key] = _build(self._list_children(kid))
                 else:
-                    out[key] = self._vid_to_str(vv)
+                    out[key] = self._val_trie.restore_key(vv)
             return out
         return _build(self._louds_root_list)
 
@@ -267,18 +264,7 @@ class CompactTree:
 
     def _vid_to_str(self, vid: int) -> str:
         """Convert a value ID to the corresponding string."""
-        off = 0
-        for i in range(vid + 1):
-            ln = struct.unpack("<I", self.val[off:off + 4])[0]
-            off += 4
-            if i == vid:
-                val_slice = self.val[off:off + ln]
-                # Handle both bytes and memoryview for compatibility
-                if isinstance(val_slice, memoryview):
-                    return val_slice.tobytes().decode("utf-8")
-                return val_slice.decode("utf-8")
-            off += ln
-        raise IndexError(f"vid {vid} out of range")
+        return self._val_trie.restore_key(vid)
 
     def _list_children(self, louds_pos: int) -> list[int]:
         """List all children of a node at a given LOUDS position."""
@@ -319,10 +305,10 @@ class CompactTree:
             return self.tree._list_children(self.pos)
 
         def __getitem__(self, key: str) -> Any:
-            if key not in self.tree._key2vid:
+            if key not in self.tree._key_trie:
                 raise KeyError(key)
             kids = self._children()
-            child_pos = self.tree._find_child(kids, self.tree._key2vid[key])
+            child_pos = self.tree._find_child(kids, self.tree._key_trie[key])
             if child_pos is None:
                 raise KeyError(key)
             return self.tree._resolve(child_pos)
@@ -331,13 +317,13 @@ class CompactTree:
             for kid in self._children():
                 kv = struct.unpack("<I", self.tree.elbl[(kid - 1) * 4:
                                                         (kid - 1) * 4 + 4])[0]
-                yield self.tree._dawg_keys[kv]
+                yield self.tree._key_trie.restore_key(kv)
 
         def __contains__(self, key: str) -> bool:
-            if key not in self.tree._key2vid:
+            if key not in self.tree._key_trie:
                 return False
             return self.tree._find_child(
-                self._children(), self.tree._key2vid[key],
+                self._children(), self.tree._key_trie[key],
             ) is not None
 
         def __len__(self) -> int:
@@ -365,10 +351,10 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     def __getitem__(self, key: str) -> Any:
-        if key not in self._key2vid:
+        if key not in self._key_trie:
             raise KeyError(key)
         child_pos = self._find_child(
-            self._louds_root_list, self._key2vid[key],
+            self._louds_root_list, self._key_trie[key],
         )
         if child_pos is None:
             raise KeyError(key)
@@ -378,13 +364,13 @@ class CompactTree:
         for kid in self._louds_root_list:
             kv = struct.unpack("<I", self.elbl[(kid - 1) * 4:
                                                (kid - 1) * 4 + 4])[0]
-            yield self._dawg_keys[kv]
+            yield self._key_trie.restore_key(kv)
 
     def __contains__(self, key: str) -> bool:
-        if key not in self._key2vid:
+        if key not in self._key_trie:
             return False
         return self._find_child(
-            self._louds_root_list, self._key2vid[key],
+            self._louds_root_list, self._key_trie[key],
         ) is not None
 
     def __len__(self) -> int:
@@ -416,14 +402,14 @@ class CompactTree:
         import io
         buf = io.BytesIO()
         # Serialize to an in-memory buffer
-        keys_bytes = bytes(self._keys_buf)
-        val_bytes = bytes(self.val)
+        keys_bytes = self._key_trie.to_bytes()
+        val_bytes = self._val_trie.to_bytes()
         louds_bytes = self.louds._ba.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
         
         buf.write(b"CTree")
-        buf.write(struct.pack("<Q", 2))
+        buf.write(struct.pack("<Q", 3))
         buf.write(struct.pack(
             "<QQQQQ",
             len(keys_bytes), len(val_bytes), len(louds_bytes),
@@ -446,21 +432,21 @@ class CompactTree:
         
         # Read header
         magic, ver = struct.unpack("<5sQ", f.read(13))
-        assert magic == b"CTree" and ver == 2
+        assert magic == b"CTree" and ver == 3
 
         # Read section lengths
         keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
             "<QQQQQ", f.read(40),
         )
 
-        # Read and parse keys section
+        # Read and parse keys MarisaTrie
         tree = CompactTree.__new__(CompactTree)
-        tree._keys_buf = f.read(keys_len)
-        tree._dawg_keys = CompactTree._unpack_strings(tree._keys_buf)
-        tree._key2vid = {k: i for i, k in enumerate(tree._dawg_keys)}
+        keys_bytes = f.read(keys_len)
+        tree._key_trie = MarisaTrie.from_bytes(keys_bytes)
 
-        # Read values section
-        tree.val = f.read(val_len)
+        # Read values MarisaTrie
+        val_bytes = f.read(val_len)
+        tree._val_trie = MarisaTrie.from_bytes(val_bytes)
 
         # Read and parse LOUDS section
         ba = bitarray()
