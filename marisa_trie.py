@@ -168,7 +168,15 @@ class MarisaTrie:
         
         # Compute subtree counts bottom-up using direct child relationships
         self._compute_counts_optimized(children_map)
-        
+
+        # Build fast {word: idx} mapping from the intermediate structures
+        # (plain Python dicts, zero rank/select calls).  Stored temporarily
+        # and consumed by the first to_dict() call; freed immediately after
+        # so it does not inflate run-time memory.
+        self._word_to_idx: dict[str, int] = (
+            self._build_word_index_from_intermediate(nodes_metadata, children_map)
+        )
+
         # No tail trie for now (simplified - full recursive MARISA not implemented)
         self._tail_trie = None
 
@@ -196,6 +204,50 @@ class MarisaTrie:
         
         # Opt 4: single bulk struct.pack instead of N individual calls
         self._counts = struct.pack(f"<{num_nodes}I", *counts)
+
+    def _build_word_index_from_intermediate(
+        self,
+        nodes_metadata: list,
+        children_map: dict[int, list[int]],
+    ) -> "dict[str, int]":
+        """Build ``{word: idx}`` from intermediate BFS metadata without any
+        LOUDS traversal.
+
+        Uses the same pre-order index assignment as ``_index_uncached``:
+        a node's terminal (if any) is numbered before its children,
+        children ordered left-to-right.
+
+        Args:
+            nodes_metadata: List of ``(inode, label, is_terminal)`` tuples in
+                BFS order, as produced by ``_build_louds``.
+            children_map: Maps each node index to its ordered child indices;
+                key ``-1`` holds the root's immediate children.
+        """
+        result: dict[str, int] = {}
+        idx = 0
+
+        if self._root_is_terminal:
+            result[""] = 0
+            idx = 1
+
+        # DFS stack: (node_idx, accumulated_prefix)
+        _get = children_map.get
+        stack: list[tuple[int, str]] = []
+        for child_idx in reversed(_get(-1, [])):
+            stack.append((child_idx, nodes_metadata[child_idx][1]))
+
+        while stack:
+            node_idx, prefix = stack.pop()
+            _, _, is_terminal = nodes_metadata[node_idx]
+            if is_terminal:
+                result[prefix] = idx
+                idx += 1
+            children = _get(node_idx)
+            if children:
+                for child_idx in reversed(children):
+                    stack.append((child_idx, prefix + nodes_metadata[child_idx][1]))
+
+        return result
 
     # ------------------------------------------------------------------ #
     #  Forward lookup: word -> index                                       #
@@ -371,27 +423,32 @@ class MarisaTrie:
     # ------------------------------------------------------------------ #
 
     def to_dict(self) -> dict[str, int]:
-        """Return ``{word: index}`` for every word via a single DFS traversal.
+        """Return ``{word: index}`` for every word in O(N).
 
-        Equivalent to ``{w: self.index(w) for w in self}`` but performs only
-        one pass over the LOUDS tree instead of one trie traversal per word.
-        Indices follow the same pre-order assignment as ``_index_uncached``:
-        a node's own terminal (if any) is numbered before those of its
-        children, children ordered left-to-right.
+        **First call after construction** returns the index built cheaply
+        from the intermediate trie (no LOUDS traversal) and immediately
+        frees it from the instance to keep run-time memory minimal.
+
+        **Subsequent calls**, or calls on a trie loaded from disk via
+        ``from_bytes``, fall back to a single DFS over the LOUDS bit vector.
         """
+        # Fast path: intermediate index present (set by _build_louds).
+        # Pop it so the memory is released right after the caller is done.
+        cached: dict[str, int] | None = self.__dict__.pop("_word_to_idx", None)
+        if cached is not None:
+            return cached
+
+        # Fallback: single DFS over the LOUDS bit vector.
         result: dict[str, int] = {}
         if self._n == 0:
             return result
 
         idx = 0
-        # DFS stack entries: (louds_node_id, prefix_accumulated_so_far)
-        # Push right-to-left so the leftmost child is popped first.
         stack: list[tuple[int, str]] = [(0, "")]
 
         while stack:
             node, prefix = stack.pop()
 
-            # Emit this node if it is a terminal (word boundary)
             if node == 0:
                 if self._root_is_terminal:
                     result[prefix] = idx
@@ -401,7 +458,6 @@ class MarisaTrie:
                     result[prefix] = idx
                     idx += 1
 
-            # Collect children left-to-right, then push in reverse order
             children: list[tuple[int, str]] = []
             child = self._louds.first_child(node)
             while child is not None:
