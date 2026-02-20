@@ -9,6 +9,12 @@ This document tracks all performance optimizations made to the `compact_tree` an
   - [Optimization #2: Cache Key Lookups](#optimization-2-cache-key-lookups)
   - [Optimization #3: O(1) Label Access](#optimization-3-o1-label-access)
   - [Combined Impact](#combined-impact)
+  - [Optimization #4: LRU Cache for MarisaTrie Lookups](#optimization-4-lru-cache-for-marisatrie-lookups)
+  - [Optimization #5: functools.lru_cache Replace OrderedDict LRU](#optimization-5-functoolslru_cache-replaces-orderdict-lru)
+  - [Optimization #6: Frozenset Key-Order Cache in _emit_children](#optimization-6-frozenset-key-order-cache-in-_emit_children)
+  - [Optimization #7: Bulk Vocabulary Enumeration via to_dict()](#optimization-7-bulk-vocabulary-enumeration-via-to_dict)
+  - [Optimization #8: Intermediate-Trie Word Index (eliminate LOUDS during build)](#optimization-8-intermediate-trie-word-index)
+  - [Combined Impact v1.2.0](#combined-impact-v120)
 - [Potential Future Optimizations](#potential-future-optimizations)
 - [Measurement Tools](#measurement-tools)
 - [Optimization Guidelines](#optimization-guidelines)
@@ -204,42 +210,184 @@ This optimization is **extraordinarily effective** for dictionaries with key reu
 
 ---
 
-## Potential Future Optimizations
+### Optimization #5: functools.lru_cache Replaces OrderedDict LRU
 
-### 1. Batch Key Encoding
+**Date:** 2026-02-20  
+**Component:** MarisaTrie
+
+**Problem:**  
+The manual `OrderedDict`-based LRU in `index()` called `move_to_end()` on every cache hit — a pure-Python method call for each lookup, adding overhead even when the answer was cached.
+
+**Solution:**  
+Install a `functools.lru_cache`-wrapped `_index_uncached` as a per-instance attribute at construction time. CPython's `lru_cache` is implemented in C and adds near-zero overhead on cache hits.
+
+**Code Changes:**
+
+```python
+# Before (in __init__):
+self._index_cache: OrderedDict[str, int] = OrderedDict()
+self._cache_size = 4096
+
+# After (in __init__):
+self.index = lru_cache(maxsize=4096)(self._index_uncached)
+```
+
+**Results:**
+- Eliminated ~141K `move_to_end()` Python calls per 37K-entry build
+- Marginal wall-time saving alone; foundational for Optimization #7
+
+---
+
+### Optimization #6: Frozenset Key-Order Cache in _emit_children
+
+**Date:** 2026-02-20  
+**Component:** CompactTree
+
+**Problem:**  
+In a 3-level dict where all L2 sub-dicts share the same L2 key set (e.g. 9 × 4 = 36 sibling dicts each with 173K identical keys), `_emit_children` re-sorted and re-looked-up every key on every visit.
+
+**Solution:**  
+Cache `(sorted_keys, key_indices)` keyed by `frozenset(node.keys())`. On subsequent visits to a dict with the same key set, reuse the cached order.
+
+**Code Changes:**
+
+```python
+_key_order_cache: dict[frozenset, tuple[list[str], dict[str, int]]] = {}
+
+def _emit_children(node):
+    keyset = frozenset(node.keys())
+    cached = _key_order_cache.get(keyset)
+    if cached is None:
+        indices = {k: key_id[k] for k in node.keys()}
+        sorted_keys = sorted(node.keys(), key=lambda k: indices[k])
+        _key_order_cache[keyset] = (sorted_keys, indices)
+    else:
+        sorted_keys, indices = cached
+    ...
+```
+
+**Results:**  
+For the 9 × 4 × 173K benchmark: 36 L1 nodes share one key set → sorting work done once instead of 36 times. Key-lookup dict built once per unique key set.
+
+---
+
+### Optimization #7: Bulk Vocabulary Enumeration via to_dict()
+
+**Date:** 2026-02-20  
+**Component:** CompactTree + MarisaTrie
+
+**Problem:**  
+Before BFS encoding, `from_dict` pre-warmed the `lru_cache` by calling `key_trie.index(w)` for every unique key and `val_trie.index(v)` for every unique value — one full LOUDS trie traversal per word. At 173K unique keys + 9.5K unique values this was 182K traversals driving 20.6M `bits.popcount` calls.
+
+**Solution:**  
+Add `MarisaTrie.to_dict()` — a single pre-order DFS over the LOUDS bit vector that assigns the running MPH index as it visits each terminal node, returning `{word: idx}` for all words in one pass. Replace the pre-warm loop with two `to_dict()` calls (one per trie).
+
+**Code Changes:**
+
+```python
+# Before (from_dict):
+key_trie.index = lru_cache(maxsize=None)(key_trie._index_uncached)
+for k in all_keys:
+    key_trie.index(k)   # one LOUDS traversal per key
+
+# After:
+key_id: dict[str, int] = key_trie.to_dict()   # single DFS
+val_id: dict[str, int] = val_trie.to_dict()   # single DFS
+# _emit_children uses key_id[k] / val_id[v] — O(1) dict lookup
+```
+
+**Results (173K L2 keys):**
+
+| Metric | Before | After |
+|---|---|---|
+| `bits.popcount` calls | 20.6M | 5.5M |
+| `to_dict` / pre-warm time | 37.6s | 2.5s |
+| Individual `_index_uncached` calls | 182K | 0 |
+
+---
+
+### Optimization #8: Intermediate-Trie Word Index
+
+**Date:** 2026-02-20  
+**Component:** MarisaTrie
+
+**Problem:**  
+Even the single-pass `to_dict()` DFS (Opt #7) traverses the LOUDS bit vector — 275K nodes × one `select_zero`/`rank`/`popcount` chain each = 5.5M popcount calls (2.5s at 173K).
+
+**Insight:**  
+During `_build_louds()` the intermediate `nodes_metadata` (list of `(inode, label, is_terminal)` in BFS order) and `children_map` (parent→children mapping) are already in memory and contain everything needed to build `{word: idx}`. A DFS over these plain Python structures requires zero rank/select calls.
+
+**Solution:**  
+Add `_build_word_index_from_intermediate()` — a DFS over `nodes_metadata`/`children_map` that assigns MPH indices identically to `_index_uncached`. Store the result as `self._word_to_idx`. `to_dict()` pops this attribute on first call (fast path, frees the dict immediately); omitted on deserialized tries, which fall back to the LOUDS DFS.
+
+**Memory contract:**  
+`_word_to_idx` exists only between the end of `__init__` and the first `to_dict()` call. It is never present at query time, preserving the run-time memory budget.
+
+**Code Changes:**
+
+```python
+# End of _build_louds():
+self._word_to_idx = self._build_word_index_from_intermediate(
+    nodes_metadata, children_map
+)
+
+# to_dict():
+cached = self.__dict__.pop("_word_to_idx", None)
+if cached is not None:
+    return cached          # O(1), no LOUDS traversal, freed immediately
+# ... fallback LOUDS DFS ...
+```
+
+**Results (173K L2 keys):**
+
+| Metric | Opt #7 only | Opt #7 + #8 |
+|---|---|---|
+| `bits.popcount` calls | 5.5M | **406K** |
+| `to_dict` cumulative time | 2.5s | **0.3s** |
+| Speedup vs pre-warming | 15× | **125×** |
+
+---
+
+### Combined Impact v1.2.0
+
+**Benchmark:** 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries, vocabulary from corpus n-gram permutations (N=1..7, ~4.4M unique strings).
+
+| Metric | v1.1.0 | v1.2.0 | Improvement |
+|---|---|---|---|
+| `from_dict` wall time (real) | ~22s | ~10s | **2.2× faster** |
+| `from_dict` wall time (profiler) | 59.8s | 26.5s | **2.3× faster** |
+| Total function calls | 225M | 92M | **2.4× fewer** |
+| `bits.popcount` calls during build | 20.6M | 406K | **50× fewer** |
+| `to_dict` / warm-up cumulative | 37.6s | 0.3s | **125× faster** |
+
+**Remaining bottlenecks (v1.2.0):**
+
+| Hotspot | Time | % Total | Notes |
+|---|---|---|---|
+| `_emit_children` BFS | 14.0s | 53% | 6.2M leaves × 3 struct ops |
+| `_walk_dict` | 4.3s | 16% | 6.2M leaf visits |
+| `MarisaTrie.__init__` ×2 | 3.9s | 15% | trie build + LOUDS construction |
+
+### 1. Batch BFS Buffer Writes
 
 **Idea:**  
-Instead of looking up keys one at a time during build, batch-encode all unique keys in a node's subtree.
+Pre-allocate `vcol_buf` and `elbl_buf` as `array.array('I', [0] * total_nodes)` and write with `array.__setitem__` instead of per-leaf `struct.pack` + `bytearray.extend`. Would reduce 12.7M individual `struct.pack` + 13M `bytearray.extend` calls to two bulk memory writes.
 
-**Estimated Impact:** Redundant with LRU cache - both solve same problem  
-**Status:** Not recommended - LRU cache is simpler and more effective
+**Estimated impact:** 30–50% reduction in `_emit_children` time (~4–7s saving at 173K)
 
-### 2. Skip Sorting (Optional)
-
-**Idea:**  
-Make key sorting optional for users who don't need deterministic order (faster builds, non-deterministic serialization).
-
-**Estimated Impact:** ~5-10% faster builds  
-**Tradeoff:** Breaking change, determinism loss  
-**Status:** Marginal benefit given current performance (0.029s build time)
-
-### 3. Cython/PyPy Compilation
+### 2. Compiled rank/select (gmpy2 or C extension)
 
 **Idea:**  
-Compile hot paths (LOUDS navigation, rank/select) with Cython.
+Replace pure-Python `succinct.poppy` rank/select with compiled popcount. Even after Optimization #8, 406K `bits.popcount` calls remain (for `Poppy.__init__` during trie construction). A C-level `__builtin_popcountll` would reduce those to near-zero.
 
-**Estimated Impact:** 2-5x faster for remaining overhead (could reach ~0.010s)  
-**Tradeoff:** Build complexity, platform-specific binaries  
-**Status:** Only worth it for extremely large datasets (1M+ entries)
+**Estimated impact:** Minor at current scale; significant only if LOUDS DFS fallback (deserialization path) is on the critical path.
 
-### 4. Parallel Building
+### 3. Cython/PyPy Compilation of hot BFS loop
 
 **Idea:**  
-Build subtries in parallel using `ProcessPoolExecutor` (not ThreadPool due to GIL).
+Compile `_emit_children` and `_walk_dict` with Cython. At 6.2M leaves, Python dispatch overhead dominates these loops.
 
-**Estimated Impact:** Near-linear scaling with cores for massive datasets  
-**Complexity:** High - requires merge logic, inter-process communication  
-**Status:** Only relevant for multi-million entry trees where 30ms is too slow
+**Estimated impact:** 3–5× speedup on `_emit_children`, bringing 173K real time from ~10s to ~3–4s.
 
 ---
 

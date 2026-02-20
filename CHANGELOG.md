@@ -7,7 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-02-15
+## [1.2.0] - 2026-02-20
+
+### Added
+
+- `MarisaTrie.to_dict()` — bulk O(N) enumeration returning `{word: index}` for every word. On the first call after construction it returns the index built cheaply from the intermediate trie data (zero LOUDS traversals) and frees it immediately; subsequent calls or calls on deserialized tries fall back to a single DFS over the LOUDS bit vector.
+- `MarisaTrie._build_word_index_from_intermediate()` — private helper that walks the BFS `nodes_metadata` / `children_map` structures (plain Python dicts, no rank/select) to produce a `{word: idx}` mapping during `__init__`.
+- `_word_to_idx` temporary instance attribute on `MarisaTrie` — produced during `_build_louds`, consumed and freed by the first `to_dict()` call, keeping run-time memory minimal.
+- Frozenset-keyed `_key_order_cache` in `CompactTree._emit_children()` — sibling dicts sharing the same key set pay the sorting and index-lookup cost only once regardless of how many times that key set appears across the tree.
+- `profile_synthetic.py` — profiling harness using corpus n-gram permutations (N=1..7, 4.4M unique strings) as a realistic vocabulary for 3-level nested dicts.
+- `vocabulary_size` keyword argument to `CompactTree.from_dict()` (deprecated no-op, kept for backward compatibility).
+
+### Changed
+
+- `CompactTree.from_dict()` now calls `key_trie.to_dict()` and `val_trie.to_dict()` once each (single O(N) DFS per trie) instead of invoking `_index_uncached` per unique word. Eliminates all rank/select overhead during the vocabulary warm-up phase.
+- `MarisaTrie.index()` LRU implementation replaced: `OrderedDict`-based manual LRU removed in favour of a `functools.lru_cache`-wrapped `_index_uncached` installed as a per-instance attribute at construction and deserialization time. Eliminates `move_to_end` overhead and benefits from CPython's C-level cache implementation.
+- Several micro-optimizations in `MarisaTrie._build_louds()`: inline child iteration (no per-node list allocation), arithmetic label-offset tracking (avoids `len(labels_buf)` calls), single-pass `nodes_metadata` loop for labels + terminal bits, and bulk `struct.pack` in `_compute_counts_optimized`.
+
+### Performance
+
+Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries, vocabulary from corpus n-gram permutations.
+
+| Metric | v1.1.0 | v1.2.0 | Improvement |
+|---|---|---|---|
+| `from_dict` wall time (real) | ~22s | ~10s | **2.2× faster** |
+| `from_dict` wall time (profiler) | 59.8s | 26.5s | **2.3× faster** |
+| `bits.popcount` calls during build | 20.6M | 406K | **50× fewer** |
+| `to_dict` / warm-up cumulative | 37.6s | 0.3s | **125× faster** |
+| Total function calls | 225M | 92M | **2.4× fewer** |
 
 ### Added
 
