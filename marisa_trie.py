@@ -79,7 +79,6 @@ class MarisaTrie:
                 if char not in node:
                     node[char] = {}
                 node = node[char]
-            # Mark terminal with empty string sentinel
             node[""] = True
         return root
 
@@ -108,46 +107,38 @@ class MarisaTrie:
             """Emit children of an intermediate node, applying path compression."""
             nonlocal next_node_idx
             
-            children = [(k, v) for k, v in inode.items() if k != ""]
-            
-            if not children:
-                # Leaf node (terminal only, no children)
-                louds_bits.append(False)
-                return
-            
+            # Opt 2: iterate inline — no upfront list allocation per node
             child_indices = []
-            for char, child_node in children:
-                # Apply path compression: if child has exactly one non-terminal child,
-                # merge the edge labels
+            for char, child_node in inode.items():
+                if char == "":
+                    continue
+                
+                # Opt 1: path compression without allocating a list each iteration
                 label = char
                 current = child_node
                 while True:
-                    # Check if current is terminal
-                    is_term = "" in current
-                    # Get non-terminal children
-                    next_children = [(k, v) for k, v in current.items() if k != ""]
-                    
-                    # Stop if terminal or has multiple/zero children
-                    if is_term or len(next_children) != 1:
+                    has_term = "" in current
+                    # len(current) - has_term gives non-terminal child count, no list alloc
+                    if has_term or len(current) - has_term != 1:
                         break
-                    
-                    # Merge the single child's edge
-                    next_char, next_node = next_children[0]
-                    label += next_char
-                    current = next_node
+                    # Single non-terminal child: grab it with one short loop
+                    for k, v in current.items():
+                        if k != "":
+                            label += k
+                            current = v
+                            break
                 
-                # Emit the compressed edge
                 louds_bits.append(True)
-                is_terminal = "" in current
                 child_idx = next_node_idx
                 next_node_idx += 1
                 child_indices.append(child_idx)
-                nodes_metadata.append((current, label, is_terminal))
+                nodes_metadata.append((current, label, "" in current))
                 node_queue.append((current, child_idx))
             
-            # Store children relationship
-            children_map[parent_idx] = child_indices
+            # Always emit the LOUDS 0-terminator for this node
             louds_bits.append(False)
+            if child_indices:
+                children_map[parent_idx] = child_indices
         
         # Emit root's children (parent is -1 for root)
         _emit_children(root, -1)
@@ -157,18 +148,16 @@ class MarisaTrie:
             node, parent_idx = node_queue.popleft()
             _emit_children(node, parent_idx)
         
-        # Pack labels (length-prefixed UTF-8 per node) and build offset index
+        # Opt 5: single pass over nodes_metadata for labels + terminal bits
         label_offsets = []
         offset = 0
-        for _, label, _ in nodes_metadata:
+        for _, label, is_term in nodes_metadata:
             label_bytes = label.encode("utf-8")
+            lb_len = len(label_bytes)
             label_offsets.append(offset)
-            labels_buf.extend(struct.pack("<I", len(label_bytes)))
+            labels_buf.extend(struct.pack("<I", lb_len))
             labels_buf.extend(label_bytes)
-            offset = len(labels_buf)
-        
-        # Terminal bits (one per node, aligned with nodes_metadata)
-        for _, _, is_term in nodes_metadata:
+            offset += 4 + lb_len  # arithmetic, avoids len(labels_buf) call
             terminal_bits.append(is_term)
         
         # Store LOUDS, labels, and label offsets
@@ -192,23 +181,21 @@ class MarisaTrie:
         num_nodes = len(self._terminal)
         counts = [0] * num_nodes
         
+        # Opt 6: use dict.get to avoid double-lookup ("in" + "[]") per node
+        _get = children_map.get
+        terminal = self._terminal
+        
         # Bottom-up traversal: process nodes in reverse order
         for node_idx in range(num_nodes - 1, -1, -1):
-            # Count starts with 1 if terminal
-            count = 1 if self._terminal[node_idx] else 0
-            
-            # Add counts from all children using direct mapping
-            if node_idx in children_map:
-                for child_idx in children_map[node_idx]:
+            count = 1 if terminal[node_idx] else 0
+            children = _get(node_idx)
+            if children:
+                for child_idx in children:
                     count += counts[child_idx]
-            
             counts[node_idx] = count
         
-        # Pack counts as uint32
-        counts_buf = bytearray()
-        for c in counts:
-            counts_buf.extend(struct.pack("<I", c))
-        self._counts = bytes(counts_buf)
+        # Opt 4: single bulk struct.pack instead of N individual calls
+        self._counts = struct.pack(f"<{num_nodes}I", *counts)
 
     # ------------------------------------------------------------------ #
     #  Forward lookup: word -> index                                       #
