@@ -85,11 +85,18 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CompactTree":
+    def from_dict(cls, data: dict[str, Any], *,
+                  vocabulary_size: Optional[int] = None) -> "CompactTree":
         """Build a *CompactTree* entirely in memory from a nested Python dict.
 
         Keys must be strings.  Leaf values are stored as strings (non-string
         values are converted via ``str()``).
+
+        Args:
+            vocabulary_size: Deprecated and ignored.  Kept for backward
+                compatibility only.  The key and value tries are now enumerated
+                with a single DFS pass (``MarisaTrie.to_dict()``) so no LRU
+                cache is needed during BFS encoding.
         """
         # 1. Collect vocabulary and leaf values
         all_keys: set[str] = set()
@@ -100,7 +107,15 @@ class CompactTree:
         key_trie = MarisaTrie(all_keys)
 
         # 3. Build MarisaTrie for values (deduplicated)
-        val_trie = MarisaTrie(all_values)
+        unique_values: set[str] = set(str(v) for v in all_values)
+        val_trie = MarisaTrie(unique_values)
+
+        # Build plain {word: idx} dicts via a single DFS over each trie.
+        # This replaces the old pre-warm loop: instead of N individual trie
+        # traversals (one per unique word), we do exactly one O(N) DFS pass
+        # per trie, eliminating all rank/select overhead for the warm-up phase.
+        key_id: dict[str, int] = key_trie.to_dict()
+        val_id: dict[str, int] = val_trie.to_dict()
 
         # 4. BFS -> LOUDS bits + vcol + elbl
         louds_bits = bitarray()
@@ -108,18 +123,29 @@ class CompactTree:
         elbl_buf = bytearray()
         queue: deque[Optional[dict]] = deque()
 
+        # Cache (sorted_keys, key_indices) by frozenset of key names so that
+        # sibling dicts with the same key set pay the MarisaTrie lookup cost
+        # only once regardless of how many times that key set appears.
+        _key_order_cache: dict[frozenset, tuple[list[str], dict[str, int]]] = {}
+
         def _emit_children(node: dict[str, Any]) -> None:
-            # Cache key lookups to avoid repeated MarisaTrie traversals
-            key_indices = {k: key_trie[k] for k in node.keys()}
-            for key in sorted(node.keys(), key=lambda k: key_indices[k]):
+            keyset = frozenset(node.keys())
+            cached = _key_order_cache.get(keyset)
+            if cached is None:
+                indices = {k: key_id[k] for k in node.keys()}
+                sorted_keys = sorted(node.keys(), key=lambda k: indices[k])
+                _key_order_cache[keyset] = (sorted_keys, indices)
+            else:
+                sorted_keys, indices = cached
+            for key in sorted_keys:
                 louds_bits.append(True)
-                elbl_buf.extend(struct.pack("<I", key_indices[key]))
+                elbl_buf.extend(struct.pack("<I", indices[key]))
                 child = node[key]
                 if isinstance(child, dict):
                     vcol_buf.extend(struct.pack("<I", _INTERNAL))
                     queue.append(child)
                 else:
-                    vcol_buf.extend(struct.pack("<I", val_trie[str(child)]))
+                    vcol_buf.extend(struct.pack("<I", val_id[str(child)]))
                     queue.append(None)          # leaf placeholder
             louds_bits.append(False)
 

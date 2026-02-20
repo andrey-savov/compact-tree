@@ -3,7 +3,8 @@
 import gzip
 import struct
 from typing import BinaryIO, Iterable, Optional
-from collections import deque, OrderedDict
+from collections import deque
+from functools import lru_cache
 
 from bitarray import bitarray
 from succinct.poppy import Poppy
@@ -48,8 +49,8 @@ class MarisaTrie:
             self._label_offsets = []
             self._tail_trie: Optional[MarisaTrie] = None
             self._root_is_terminal = False
-            self._index_cache: OrderedDict[str, int] = OrderedDict()
-            self._cache_size = 4096
+            # Install C-level LRU cache as instance attribute (shadows class method)
+            self.index = lru_cache(maxsize=4096)(self._index_uncached)
             return
         
         # Build intermediate trie structure
@@ -58,12 +59,11 @@ class MarisaTrie:
         # Check if root is terminal (empty string in trie)
         self._root_is_terminal = "" in root
         
-        # Initialize LRU cache for lookups
-        self._index_cache: OrderedDict[str, int] = OrderedDict()
-        self._cache_size = 4096
-        
         # Apply path compression and convert to LOUDS
         self._build_louds(root)
+
+        # Install C-level LRU cache as instance attribute (shadows class method)
+        self.index = lru_cache(maxsize=4096)(self._index_uncached)
 
     def _build_intermediate_trie(self, words: list[str]) -> dict:
         """Build an intermediate dict-of-dicts trie from unique words.
@@ -203,32 +203,22 @@ class MarisaTrie:
 
     def index(self, word: str) -> int:
         """Return the unique index for a word in [0, N).
-        
+
+        At runtime this method is shadowed by a per-instance
+        ``lru_cache``-wrapped version of ``_index_uncached`` installed in
+        ``__init__`` and ``from_bytes``, so it is never actually called.
+        It is kept here solely as readable interface documentation.
+
         Args:
             word: The word to look up.
-            
+
         Returns:
             Unique integer in [0, N).
-            
+
         Raises:
             KeyError: If word is not in the trie.
         """
-        # Check cache first
-        if word in self._index_cache:
-            # Move to end (most recently used)
-            self._index_cache.move_to_end(word)
-            return self._index_cache[word]
-        
-        # Compute index (fallthrough to existing logic)
-        result = self._index_uncached(word)
-        
-        # Add to cache (with LRU eviction)
-        self._index_cache[word] = result
-        if len(self._index_cache) > self._cache_size:
-            # Remove least recently used (first item)
-            self._index_cache.popitem(last=False)
-        
-        return result
+        return self._index_uncached(word)
     
     def _index_uncached(self, word: str) -> int:
         """Uncached implementation of index lookup."""
@@ -377,6 +367,54 @@ class MarisaTrie:
         return struct.unpack("<I", self._counts[offset:offset + 4])[0]
 
     # ------------------------------------------------------------------ #
+    #  Bulk enumeration                                                    #
+    # ------------------------------------------------------------------ #
+
+    def to_dict(self) -> dict[str, int]:
+        """Return ``{word: index}`` for every word via a single DFS traversal.
+
+        Equivalent to ``{w: self.index(w) for w in self}`` but performs only
+        one pass over the LOUDS tree instead of one trie traversal per word.
+        Indices follow the same pre-order assignment as ``_index_uncached``:
+        a node's own terminal (if any) is numbered before those of its
+        children, children ordered left-to-right.
+        """
+        result: dict[str, int] = {}
+        if self._n == 0:
+            return result
+
+        idx = 0
+        # DFS stack entries: (louds_node_id, prefix_accumulated_so_far)
+        # Push right-to-left so the leftmost child is popped first.
+        stack: list[tuple[int, str]] = [(0, "")]
+
+        while stack:
+            node, prefix = stack.pop()
+
+            # Emit this node if it is a terminal (word boundary)
+            if node == 0:
+                if self._root_is_terminal:
+                    result[prefix] = idx
+                    idx += 1
+            else:
+                if self._terminal[node - 1]:
+                    result[prefix] = idx
+                    idx += 1
+
+            # Collect children left-to-right, then push in reverse order
+            children: list[tuple[int, str]] = []
+            child = self._louds.first_child(node)
+            while child is not None:
+                label = self._get_label(child - 1)
+                children.append((child, prefix + label))
+                child = self._louds.next_sibling(child)
+
+            for c in reversed(children):
+                stack.append(c)
+
+        return result
+
+    # ------------------------------------------------------------------ #
     #  Dunder methods                                                      #
     # ------------------------------------------------------------------ #
 
@@ -521,10 +559,9 @@ class MarisaTrie:
             length = struct.unpack("<I", labels_bytes[offset:offset + 4])[0]
             offset += 4 + length
         
-        # Initialize LRU cache
-        trie._index_cache = OrderedDict()
-        trie._cache_size = 4096
-        
+        # Install C-level LRU cache as instance attribute (shadows class method)
+        trie.index = lru_cache(maxsize=4096)(trie._index_uncached)
+
         return trie
 
     def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
