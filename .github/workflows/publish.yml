@@ -22,12 +22,9 @@ jobs:
             artifact-name: linux
           - os: windows-latest
             artifact-name: windows
-          - os: macos-13
-            artifact-name: macos-x86_64
-            cibw-archs: x86_64
           - os: macos-latest
-            artifact-name: macos-arm64
-            cibw-archs: arm64
+            artifact-name: macos
+            cibw-archs: arm64 x86_64
             cibw-skip: cp39-macosx_arm64
 
     steps:
