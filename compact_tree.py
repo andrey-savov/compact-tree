@@ -1,5 +1,8 @@
+import array
+import bisect
 import gzip
 import struct
+import sys
 from typing import Any, BinaryIO, Iterator, Optional
 
 from bitarray import bitarray
@@ -302,8 +305,8 @@ class CompactTree:
         tree._louds_ba = ba
         tree._child_start = _child_start_arr
         tree._child_count = _child_count_arr
-        tree.vcol = bytes(_vcol_arr)
-        tree.elbl = bytes(_elbl_arr)
+        tree.vcol = _vcol_arr
+        tree.elbl = _elbl_arr
         tree._louds_root_list = tree._list_children(0)
         return tree
 
@@ -370,8 +373,12 @@ class CompactTree:
                 self._child_start, self._child_count = CompactTree._decode_louds(ba)
 
                 # Read vcol and elbl sections
-                self.vcol = f.read(vcol_len)
-                self.elbl = f.read(elbl_len)
+                _vcol = array.array('I'); _vcol.frombytes(f.read(vcol_len))
+                if sys.byteorder != 'little': _vcol.byteswap()
+                self.vcol = _vcol
+                _elbl = array.array('I'); _elbl.frombytes(f.read(elbl_len))
+                if sys.byteorder != 'little': _elbl.byteswap()
+                self.elbl = _elbl
 
         # No file handles kept open
         self.fs = None
@@ -430,13 +437,9 @@ class CompactTree:
         def _build(kids: list[int]) -> dict:
             out: dict[str, object] = {}
             for kid in kids:
-                kv = struct.unpack(
-                    "<I", self.elbl[(kid - 1) * 4:(kid - 1) * 4 + 4],
-                )[0]
+                kv = self.elbl[kid - 1]
                 key = self._key_trie.restore_key(kv)
-                vv = struct.unpack(
-                    "<I", self.vcol[(kid - 1) * 4:(kid - 1) * 4 + 4],
-                )[0]
+                vv = self.vcol[kid - 1]
                 if vv == _INTERNAL:
                     out[key] = _build(self._list_children(kid))
                 else:
@@ -492,18 +495,25 @@ class CompactTree:
         count = self._child_count[louds_pos]
         return list(range(start, start + count))
 
-    def _find_child(self, kids: list[int], key_vid: int) -> Optional[int]:
-        """Return the LOUDS position of the child whose edge label == *key_vid*."""
-        for kid in kids:
-            if struct.unpack("<I", self.elbl[(kid - 1) * 4:
-                                             (kid - 1) * 4 + 4])[0] == key_vid:
-                return kid
+    def _find_child(self, v: int, key_vid: int) -> Optional[int]:
+        """Binary search among children of node *v* for edge label == *key_vid*.
+
+        Valid because children are emitted sorted by key_id during from_dict.
+        Avoids materialising the children list entirely.
+        """
+        count = self._child_count[v]
+        if count == 0:
+            return None
+        lo = self._child_start[v] - 1  # 0-based elbl index of first child
+        hi = lo + count                # exclusive upper bound
+        pos = bisect.bisect_left(self.elbl, key_vid, lo, hi)
+        if pos < hi and self.elbl[pos] == key_vid:
+            return pos + 1             # back to 1-indexed LOUDS position
         return None
 
     def _resolve(self, child_pos: int) -> "str | CompactTree._Node":
         """Resolve a child position to either a leaf string or a ``_Node``."""
-        vv = struct.unpack("<I", self.vcol[(child_pos - 1) * 4:
-                                           (child_pos - 1) * 4 + 4])[0]
+        vv = self.vcol[child_pos - 1]
         if vv == _INTERNAL:
             return CompactTree._Node(self, child_pos)
         return self._vid_to_str(vv)
@@ -522,26 +532,25 @@ class CompactTree:
             return self.tree._list_children(self.pos)
 
         def __getitem__(self, key: str) -> Any:
-            if key not in self.tree._key_trie:
+            try:
+                key_vid = self.tree._key_trie[key]
+            except KeyError:
                 raise KeyError(key)
-            kids = self._children()
-            child_pos = self.tree._find_child(kids, self.tree._key_trie[key])
+            child_pos = self.tree._find_child(self.pos, key_vid)
             if child_pos is None:
                 raise KeyError(key)
             return self.tree._resolve(child_pos)
 
         def __iter__(self) -> Iterator[str]:
             for kid in self._children():
-                kv = struct.unpack("<I", self.tree.elbl[(kid - 1) * 4:
-                                                        (kid - 1) * 4 + 4])[0]
-                yield self.tree._key_trie.restore_key(kv)
+                yield self.tree._key_trie.restore_key(self.tree.elbl[kid - 1])
 
         def __contains__(self, key: str) -> bool:
-            if key not in self.tree._key_trie:
+            try:
+                key_vid = self.tree._key_trie[key]
+            except KeyError:
                 return False
-            return self.tree._find_child(
-                self._children(), self.tree._key_trie[key],
-            ) is not None
+            return self.tree._find_child(self.pos, key_vid) is not None
 
         def __len__(self) -> int:
             return len(self._children())
@@ -568,27 +577,25 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     def __getitem__(self, key: str) -> Any:
-        if key not in self._key_trie:
+        try:
+            key_vid = self._key_trie[key]
+        except KeyError:
             raise KeyError(key)
-        child_pos = self._find_child(
-            self._louds_root_list, self._key_trie[key],
-        )
+        child_pos = self._find_child(0, key_vid)
         if child_pos is None:
             raise KeyError(key)
         return self._resolve(child_pos)
 
     def __iter__(self) -> Iterator[str]:
         for kid in self._louds_root_list:
-            kv = struct.unpack("<I", self.elbl[(kid - 1) * 4:
-                                               (kid - 1) * 4 + 4])[0]
-            yield self._key_trie.restore_key(kv)
+            yield self._key_trie.restore_key(self.elbl[kid - 1])
 
     def __contains__(self, key: str) -> bool:
-        if key not in self._key_trie:
+        try:
+            key_vid = self._key_trie[key]
+        except KeyError:
             return False
-        return self._find_child(
-            self._louds_root_list, self._key_trie[key],
-        ) is not None
+        return self._find_child(0, key_vid) is not None
 
     def __len__(self) -> int:
         return len(self._louds_root_list)
@@ -693,8 +700,12 @@ class CompactTree:
         tree._child_start, tree._child_count = CompactTree._decode_louds(ba)
 
         # Read vcol and elbl sections
-        tree.vcol = f.read(vcol_len)
-        tree.elbl = f.read(elbl_len)
+        _vcol = array.array('I'); _vcol.frombytes(f.read(vcol_len))
+        if sys.byteorder != 'little': _vcol.byteswap()
+        tree.vcol = _vcol
+        _elbl = array.array('I'); _elbl.frombytes(f.read(elbl_len))
+        if sys.byteorder != 'little': _elbl.byteswap()
+        tree.elbl = _elbl
 
         # No file handles
         tree.fs = None

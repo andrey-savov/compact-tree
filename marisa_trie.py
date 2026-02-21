@@ -2,6 +2,7 @@
 
 import gzip
 import struct
+from functools import lru_cache
 from typing import BinaryIO, Iterable, Optional
 from collections import deque
 
@@ -27,9 +28,10 @@ class MarisaTrie:
     ``_node_terminal``) rather than rank-/select-based LOUDS traversal,
     giving plain list-indexing speed with zero Poppy overhead.
 
-    ``cache_size`` is accepted in ``__init__`` and ``from_bytes`` for
-    backwards-compatibility with callers that pass it; it is ignored because
-    the array trie needs no auxiliary cache.
+    ``cache_size`` controls the ``lru_cache`` capacity installed on each
+    instance's ``index()`` method.  When ``None``, defaults to the full
+    vocabulary size (all words fit in cache with zero evictions).  Pass an
+    integer to cap memory use at the cost of occasional re-traversals.
     """
 
     # ------------------------------------------------------------------ #
@@ -40,16 +42,18 @@ class MarisaTrie:
         self,
         words: Iterable[str],
         *,
-        cache_size: Optional[int] = None,  # accepted for API compat, unused
+        cache_size: Optional[int] = None,
     ) -> None:
         """Build a MarisaTrie from an iterable of strings.
 
         Args:
             words: Iterable of strings.  Duplicates are silently removed.
-            cache_size: Ignored.  Kept for backwards-compatibility.
+            cache_size: ``lru_cache`` capacity for ``index()``.  Defaults to
+                the full vocabulary size (unbounded cache hits).
         """
         unique = list(dict.fromkeys(words))
         self._n = len(unique)
+        self._cache_size: Optional[int] = cache_size
 
         if self._n == 0:
             self._root_is_terminal: bool            = False
@@ -58,11 +62,13 @@ class MarisaTrie:
             self._node_terminal:    list[bool]      = []
             self._node_children:    list[list[int]] = []
             self._node_counts:      list[int]       = []
+            self._attach_index_cache(cache_size)
             return
 
         root = self._build_intermediate_trie(unique)
         self._root_is_terminal = ("" in root)
         self._build_arrays(root)
+        self._attach_index_cache(cache_size)
 
     # ------------------------------------------------------------------ #
     #  Build helpers                                                       #
@@ -202,7 +208,18 @@ class MarisaTrie:
     #  Forward lookup: word -> index                                       #
     # ------------------------------------------------------------------ #
 
-    def index(self, word: str) -> int:
+    def _attach_index_cache(self, cache_size: Optional[int]) -> None:
+        """Install per-instance lru_caches on ``index()`` and ``restore_key()``.
+
+        Called at the end of both ``__init__`` and ``from_bytes`` so the caches
+        are always correctly sized.  Binding the caches to the instance (rather
+        than the class) keeps each trie's cache independent.
+        """
+        maxsize = cache_size if cache_size is not None else self._n or 1
+        self.index = lru_cache(maxsize=maxsize)(self._index_uncached)
+        self.restore_key = lru_cache(maxsize=self._n or 1)(self._restore_key_uncached)
+
+    def _index_uncached(self, word: str) -> int:
         """Return the dense unique index for *word* in ``[0, N)``.
 
         Navigates the in-memory radix trie using plain list indexing -
@@ -275,7 +292,7 @@ class MarisaTrie:
     #  Reverse lookup: index -> word                                       #
     # ------------------------------------------------------------------ #
 
-    def restore_key(self, idx: int) -> str:
+    def _restore_key_uncached(self, idx: int) -> str:
         """Return the word corresponding to *idx*.
 
         Raises:
@@ -447,7 +464,7 @@ class MarisaTrie:
         cls,
         data: bytes,
         *,
-        cache_size: Optional[int] = None,  # accepted for API compat, unused
+        cache_size: Optional[int] = None,
     ) -> "MarisaTrie":
         """Deserialize a trie from bytes, reconstructing the runtime arrays.
 
@@ -456,7 +473,8 @@ class MarisaTrie:
 
         Args:
             data: Binary representation produced by ``to_bytes()``.
-            cache_size: Ignored.  Kept for backwards-compatibility.
+            cache_size: ``lru_cache`` capacity for ``index()``.  Defaults to
+                the full vocabulary size.
 
         Returns:
             Reconstructed ``MarisaTrie``.
@@ -529,6 +547,8 @@ class MarisaTrie:
         trie._node_terminal    = node_terminal
         trie._node_children    = node_children
         trie._node_counts      = node_counts
+        trie._cache_size       = cache_size
+        trie._attach_index_cache(cache_size)
         return trie
 
     def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
