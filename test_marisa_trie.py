@@ -456,3 +456,34 @@ class TestEdgeCases:
         # Verify all indices are dense
         all_indices = {trie[w] for w in words}
         assert all_indices == set(range(1000))
+
+    def test_unicode_shared_first_utf8_byte(self):
+        """Words that share the same leading UTF-8 byte must all be found.
+
+        Many Latin-1 accented characters encode with the same first byte
+        (0xC3 in UTF-8), e.g. é (U+00E9 → 0xC3 0xA9) and ê (U+00EA → 0xC3
+        0xAA).  The C extension dispatches children by first UTF-8 byte, so
+        it must scan the entire equal-range and use full-label comparison —
+        not stop at the first candidate — to return the correct index.
+        """
+        # These four characters all encode with leading byte 0xC3 in UTF-8.
+        words = ["é", "ê", "è", "à"]
+        trie = MarisaTrie(words)
+        assert len(trie) == 4
+        # Every word must be found, and indices must be dense.
+        indices = {trie[w] for w in words}
+        assert indices == set(range(4))
+        for w in words:
+            assert trie.restore_key(trie[w]) == w
+
+    def test_unicode_shared_first_utf8_byte_with_prefix(self):
+        """Same first-byte collision, but words share an ASCII prefix."""
+        # "cé", "cê", "cè" all have 'c' as their ASCII first byte, then a
+        # multibyte character whose leading byte is 0xC3.
+        words = ["cé", "cê", "cè", "ca"]
+        trie = MarisaTrie(words)
+        assert len(trie) == 4
+        indices = {trie[w] for w in words}
+        assert indices == set(range(4))
+        for w in words:
+            assert trie.restore_key(trie[w]) == w

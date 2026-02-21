@@ -334,21 +334,37 @@ TrieIndex_lookup(TrieIndexObject *self, PyObject *arg)
         }
 #undef TRIE_LINEAR_THRESHOLD
 
-        uint32_t flat = start + lo;
+        /* Multiple children can share the same first UTF-8 byte (e.g. é and ê
+         * both begin with 0xC3 in UTF-8).  Scan the entire equal-range of
+         * first_byte matches and pick the first candidate whose full label
+         * matches rem via memcmp. */
+        uint32_t range_end = start + lo + 1;
+        while (range_end < start + count &&
+               ch_first_byte[range_end] == first_byte)
+            range_end++;
 
-        /* Single 8-byte load: ch_node_id (low32) + ch_pfx_count (high32) */
-        uint64_t desc    = child_desc[flat];
-        uint32_t child   = (uint32_t)desc;
-        uint32_t pfx_cnt = (uint32_t)(desc >> 32);
+        uint32_t child   = 0;
+        uint32_t pfx_cnt = 0;
+        uint32_t llen    = 0;
+        int      found   = 0;
 
-        /* Single 8-byte load: label_off (low32) + label_len (high32) */
-        uint64_t nlbl = node_label[child];
-        uint32_t loff = (uint32_t)nlbl;
-        uint32_t llen = (uint32_t)(nlbl >> 32);
-
-        /* Verify full label matches */
-        if ((Py_ssize_t)llen > rem_len ||
-            memcmp(rem, label_bytes + loff, (size_t)llen) != 0) {
+        for (uint32_t j = start + lo; j < range_end; j++) {
+            uint64_t desc = child_desc[j];
+            uint32_t c    = (uint32_t)desc;
+            uint32_t pc   = (uint32_t)(desc >> 32);
+            uint64_t nlbl = node_label[c];
+            uint32_t loff = (uint32_t)nlbl;
+            uint32_t len  = (uint32_t)(nlbl >> 32);
+            if ((Py_ssize_t)len <= rem_len &&
+                memcmp(rem, label_bytes + loff, (size_t)len) == 0) {
+                child   = c;
+                pfx_cnt = pc;
+                llen    = len;
+                found   = 1;
+                break;
+            }
+        }
+        if (!found) {
             PyErr_SetObject(PyExc_KeyError, arg);
             return NULL;
         }
@@ -440,6 +456,7 @@ typedef struct {
     const uint32_t *child_start;  /* 1-indexed first-child pos per node     */
     const uint32_t *child_count;  /* child count per node                   */
     uint32_t n_tree_nodes;        /* len(child_start) == len(child_count)   */
+    uint32_t n_elbl;              /* len(elbl) == len(vcol)                 */
 
     /*
      * Direct C pointer into the key TrieIndex so TrieIndex_lookup() can be
@@ -529,6 +546,28 @@ TreeIndex_init(TreeIndexObject *self, PyObject *args, PyObject *kwds)
         goto release_all;
     }
 
+    /* Cross-field validation: every node's child_start/child_count range
+     * must lie within the elbl/vcol arrays.  Catches corrupted or hostile
+     * serialised CompactTree data before any lookup can reach C pointers. */
+    {
+        uint32_t n_elbl_v = (uint32_t)(elbl_buf.len / 4);
+        const uint32_t *cs_v = (const uint32_t *)cs_buf.buf;
+        const uint32_t *cc_v = (const uint32_t *)cc_buf.buf;
+        for (uint32_t v = 0; v < n_tree_nodes; v++) {
+            uint32_t cnt    = cc_v[v];
+            if (cnt > 0) {
+                uint32_t cstart = cs_v[v];
+                /* cstart is 1-indexed; (cstart-1)+cnt must not exceed n_elbl */
+                if (cstart < 1 ||
+                    (uint64_t)(cstart - 1) + cnt > (uint64_t)n_elbl_v) {
+                    PyErr_SetString(PyExc_ValueError,
+                        "TreeIndex: child_start/count out of elbl bounds");
+                    goto release_all;
+                }
+            }
+        }
+    }
+
     Py_ssize_t total =
         elbl_buf.len + vcol_buf.len + cs_buf.len + cc_buf.len;
 
@@ -555,6 +594,7 @@ TreeIndex_init(TreeIndexObject *self, PyObject *args, PyObject *kwds)
     free(self->mem);
     self->mem          = mem;
     self->n_tree_nodes = n_tree_nodes;
+    self->n_elbl       = (uint32_t)(elbl_buf.len / 4);
 
     Py_INCREF(key_trie_obj);
     Py_XDECREF(self->key_trie_obj);
@@ -631,6 +671,13 @@ TreeIndex_get(TreeIndexObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "IO", &node_pos, &key))
         return NULL;
 
+    /* Bounds-check node_pos before indexing into child_count/child_start */
+    if ((uint32_t)node_pos >= self->n_tree_nodes) {
+        PyErr_SetString(PyExc_IndexError,
+                        "TreeIndex.get: node_pos out of range");
+        return NULL;
+    }
+
     /* 1. key -> key_id (C call, no Python dispatch) */
     uint32_t key_id = tree_key_to_id(self->key_trie, key);
     if (key_id == UINT32_MAX)
@@ -680,6 +727,10 @@ TreeIndex_find(TreeIndexObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "IO", &node_pos, &key))
         return NULL;
 
+    /* Bounds-check node_pos */
+    if ((uint32_t)node_pos >= self->n_tree_nodes)
+        return PyLong_FromLong(-1);
+
     uint32_t key_id = tree_key_to_id(self->key_trie, key);
     if (key_id == UINT32_MAX) {
         PyErr_Clear();
@@ -721,6 +772,13 @@ TreeIndex_get_path(TreeIndexObject *self, PyObject *args)
     if (upos == (unsigned long)-1 && PyErr_Occurred())
         return NULL;
     uint32_t pos = (uint32_t)upos;
+
+    /* Validate initial pos */
+    if (pos >= self->n_tree_nodes) {
+        PyErr_SetString(PyExc_IndexError,
+                        "TreeIndex.get_path: node_pos out of range");
+        return NULL;
+    }
 
     Py_ssize_t last = nargs - 1;
     for (Py_ssize_t i = 1; i <= last; i++) {
