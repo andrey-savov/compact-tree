@@ -11,7 +11,7 @@ Compact, read-only nested dictionary backed by succinct data structures.
 
 - **Memory-efficient**: Uses succinct data structures (LOUDS trie + MarisaTrie deduplication)
 - **Fast lookups**: O(1) rank/select operations via Poppy bit vectors
-- **High-performance builds**: LRU-cached MarisaTrie lookups and O(1) label access for 183x faster construction with key reuse
+- **High-performance builds**: 2.2× faster `from_dict` at 173K keys (v1.2.0); eliminates LOUDS rank/select during build entirely via intermediate-trie word index
 - **Serializable**: Save and load from disk with efficient binary format
 - **Gzip compression**: Optional gzip compression for even smaller files on disk
 - **Pickle support**: Fully serializable via Python's `pickle` module
@@ -107,6 +107,8 @@ Navigation relies on **rank** and **select** queries:
 - **Path compression**: single-child edges are merged for compactness
 - **Dense indexing**: every unique word gets an index in `[0, N)`
 - **Reverse lookup**: recover the original word from its index
+- **Bulk enumeration**: `to_dict()` returns `{word: index}` for all words in O(N) via a single DFS, with a zero-LOUDS fast path for newly constructed tries
+- **C-level LRU cache**: per-instance `functools.lru_cache` on `index()` lookups; cache size set automatically from vocabulary size or via the `vocabulary_size` hint on `from_dict()`
 
 ### DAWG-Style Deduplication
 
@@ -127,16 +129,17 @@ CompactTree
   +-- _val_trie  : MarisaTrie  value vocabulary (word <-> dense index)
 ```
 
-## Binary Format (v3)
+## Binary Format (v4)
 
 ```
 Magic   : 5 bytes   "CTree"
-Version : 8 bytes   uint64 LE (always 3)
-Header  : 5 x 8 bytes  lengths of: keys, values, louds, vcol, elbl
+Version : 8 bytes   uint64 LE (always 4; v3 files are still readable)
+Header  : 7 x 8 bytes  lengths of: keys, values, louds, vcol, elbl,
+                         key_vocab_size, val_vocab_size
 Payload : keys_bytes | val_bytes | louds_bytes | vcol_bytes | elbl_bytes
 ```
 
-`keys_bytes` and `val_bytes` are serialised `MarisaTrie` instances. `louds_bytes` is the raw bitarray, `vcol_bytes` and `elbl_bytes` are packed uint32 arrays.
+`keys_bytes` and `val_bytes` are serialised `MarisaTrie` instances. `louds_bytes` is the raw bitarray, `vcol_bytes` and `elbl_bytes` are packed uint32 arrays. `key_vocab_size` and `val_vocab_size` record the LRU cache sizes used during `from_dict` and are restored on load so query-time caches are immediately correctly sized.
 
 ## Dependencies
 

@@ -228,8 +228,9 @@ Install a `functools.lru_cache`-wrapped `_index_uncached` as a per-instance attr
 self._index_cache: OrderedDict[str, int] = OrderedDict()
 self._cache_size = 4096
 
-# After (in __init__):
-self.index = lru_cache(maxsize=4096)(self._index_uncached)
+# After (in __init__): cache_size defaults to None (unbounded);
+# from_dict passes len(all_keys) / len(unique_values) automatically.
+self.index = lru_cache(maxsize=cache_size)(self._index_uncached)
 ```
 
 **Results:**
