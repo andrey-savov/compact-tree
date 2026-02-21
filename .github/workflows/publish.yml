@@ -28,6 +28,7 @@ jobs:
           - os: macos-latest
             artifact-name: macos-arm64
             cibw-archs: arm64
+            cibw-skip: cp39-macosx_arm64
 
     steps:
     - uses: actions/checkout@v4
@@ -36,6 +37,7 @@ jobs:
       uses: pypa/cibuildwheel@v2.21.3
       env:
         CIBW_ARCHS_MACOS: ${{ matrix.cibw-archs }}
+        CIBW_SKIP: ${{ matrix.cibw-skip }}
 
     - name: Upload wheel artifacts
       uses: actions/upload-artifact@v4
