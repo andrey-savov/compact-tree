@@ -440,7 +440,7 @@ class MarisaTrie:
         """
         # Fast path: intermediate index present (set by _build_louds).
         # Pop it so the memory is released right after the caller is done.
-        cached: dict[str, int] | None = self.__dict__.pop("_word_to_idx", None)
+        cached: Optional[dict[str, int]] = self.__dict__.pop("_word_to_idx", None)
         if cached is not None:
             return cached
 
