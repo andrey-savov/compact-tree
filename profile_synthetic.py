@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Profile CompactTree ingestion and/or lookup of a synthetic 3-level nested dict.
 
 Dict shape (unique keys per level):
@@ -277,9 +278,14 @@ def profile_lookup(tree: CompactTree, d: dict,
     wall_elapsed = time.perf_counter() - wall_start
 
     actual_rate = n_iters / wall_elapsed
+    ns_per = 1e9 / actual_rate
+    if ns_per < 1000:
+        time_str = f"{ns_per:.1f} ns/lookup"
+    else:
+        time_str = f"{ns_per / 1000:.3f} µs/lookup"
     print(f"  Wall time: {wall_elapsed:.3f}s  "
           f"({actual_rate:,.0f} lookups/s,  "
-          f"{1e6 / actual_rate:.2f} µs/lookup)")
+          f"{time_str})")
 
     _print_profile_stats(profiler)
 

@@ -160,6 +160,115 @@ class MarisaTrie:
         # consumed and freed on the first to_dict() call.
         self._word_to_idx: dict[str, int] = self._build_word_index(children_map)
 
+    def _build_c_index(self) -> None:
+        """Build a C-level TrieIndex for fast lookup (optional).
+
+        Packs all trie arrays into flat byte buffers and creates a
+        ``_marisa_ext.TrieIndex``.  Children within each parent are sorted
+        by the first byte of their label for O(1) binary-search dispatch;
+        the MPH prefix-sum values are preserved from the original ordering
+        so that returned indices are identical to the Python implementation.
+
+        Sets ``self._c_index`` on success.  If ``_marisa_ext`` is not built
+        the method returns silently and ``_c_index`` is not set.
+        """
+        try:
+            import _marisa_ext  # noqa: PLC0415
+        except ImportError:
+            return
+
+        import array as _array
+        import sys as _sys
+
+        n = len(self._node_labels)
+
+        # Encode labels as UTF-8 bytes (ASCII for typical corpus keys).
+        label_utf8: list[bytes] = [lb.encode() for lb in self._node_labels]
+
+        # Flat label byte buffer + per-node offset / length.
+        label_bytes  = b"".join(label_utf8)
+        label_off_a  = _array.array("I")
+        label_len_a  = _array.array("I")
+        off = 0
+        for lb in label_utf8:
+            label_off_a.append(off)
+            label_len_a.append(len(lb))
+            off += len(lb)
+
+        # is_terminal as raw bytes (bool → 0/1).
+        is_terminal_b = bytes(self._node_terminal)
+
+        # Build CSR children arrays.
+        # Parent mapping: node p → ch_start[p] / ch_cnt[p]
+        #                  virtual root (n_nodes) → ch_start[n_nodes] / ...
+        ch_start_a     = _array.array("I", [0] * (n + 1))
+        ch_cnt_a       = _array.array("I", [0] * (n + 1))
+        ch_first_bytes: list[int] = []
+        ch_node_ids:    list[int] = []
+        ch_pfx_counts:  list[int] = []
+
+        flat_off = 0
+
+        # Nodes 0..n-1
+        for p in range(n):
+            children  = self._node_children[p]
+            pfx_table = self._prefix_counts[p + 1]  # _prefix_counts[node+1]
+            entries = sorted(
+                (
+                    (label_utf8[child][0], child, pfx_table[i])
+                    for i, child in enumerate(children)
+                )
+            )
+            ch_start_a[p] = flat_off
+            ch_cnt_a[p]   = len(entries)
+            for fb, cid, pfx in entries:
+                ch_first_bytes.append(fb)
+                ch_node_ids.append(cid)
+                ch_pfx_counts.append(pfx)
+            flat_off += len(entries)
+
+        # Virtual root (index n_nodes in C)
+        children  = self._root_children
+        pfx_table = self._prefix_counts[0]  # _prefix_counts[(-1)+1]
+        entries = sorted(
+            (
+                (label_utf8[child][0], child, pfx_table[i])
+                for i, child in enumerate(children)
+            )
+        )
+        ch_start_a[n] = flat_off
+        ch_cnt_a[n]   = len(entries)
+        for fb, cid, pfx in entries:
+            ch_first_bytes.append(fb)
+            ch_node_ids.append(cid)
+            ch_pfx_counts.append(pfx)
+
+        ch_node_id_a   = _array.array("I", ch_node_ids)
+        ch_pfx_count_a = _array.array("I", ch_pfx_counts)
+
+        if _sys.byteorder != "little":
+            label_off_a.byteswap()
+            label_len_a.byteswap()
+            ch_start_a.byteswap()
+            ch_cnt_a.byteswap()
+            ch_node_id_a.byteswap()
+            ch_pfx_count_a.byteswap()
+
+        self._c_index = _marisa_ext.TrieIndex(
+            label_bytes   = label_bytes,
+            label_off     = label_off_a.tobytes(),
+            label_len     = label_len_a.tobytes(),
+            is_terminal   = is_terminal_b,
+            ch_start      = ch_start_a.tobytes(),
+            ch_cnt        = ch_cnt_a.tobytes(),
+            ch_first_byte = bytes(ch_first_bytes),
+            ch_node_id    = ch_node_id_a.tobytes(),
+            ch_pfx_count  = ch_pfx_count_a.tobytes(),
+            n_nodes       = n,
+            total_n       = self._n,
+            root_is_terminal = int(self._root_is_terminal),
+        )
+
     def _build_navigation_tables(self) -> None:
         """Build O(1) child-dispatch and prefix-count structures.
 
@@ -251,12 +360,28 @@ class MarisaTrie:
     def _attach_index_cache(self, cache_size: Optional[int]) -> None:
         """Install per-instance lru_caches on ``index()`` and ``restore_key()``.
 
+        Uses the C extension (``_marisa_ext.TrieIndex``) when available;
+        falls back to the pure-Python ``_index_uncached``.
+
         Called at the end of both ``__init__`` and ``from_bytes`` so the caches
         are always correctly sized.  Binding the caches to the instance (rather
         than the class) keeps each trie's cache independent.
         """
         maxsize = cache_size if cache_size is not None else self._n or 1
-        self.index = lru_cache(maxsize=maxsize)(self._index_uncached)
+
+        # Try C-level lookup first.
+        self._build_c_index()
+        raw_lookup = getattr(self, "_c_index", None)
+        if raw_lookup is not None:
+            raw_lookup = raw_lookup.lookup
+        else:
+            raw_lookup = self._index_uncached
+
+        if maxsize == 0:
+            self.index = raw_lookup          # bypass lru_cache overhead
+        else:
+            self.index = lru_cache(maxsize=maxsize)(raw_lookup)
+
         self.restore_key = lru_cache(maxsize=self._n or 1)(self._restore_key_uncached)
 
     def _index_uncached(self, word: str) -> int:

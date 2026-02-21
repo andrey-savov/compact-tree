@@ -4,5 +4,8 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 include SECURITY.md
 include pyproject.toml
+include setup.py
 include compact_tree.py
+include marisa_trie.py
+include _marisa_ext.c
 recursive-include .github *.md *.yml

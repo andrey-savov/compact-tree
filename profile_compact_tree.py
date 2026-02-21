@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Profile CompactTree construction with co-occurrence data."""
 
 import cProfile
