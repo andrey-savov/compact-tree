@@ -67,3 +67,20 @@ exclude_lines = [
     "if __name__ == .__main__.:",
 ]
 
+[tool.cibuildwheel]
+# Build for CPython 3.9–3.13; skip 32-bit and musl targets
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-win32 *-manylinux_i686 *-musllinux_*"
+# Run the test suite after each wheel build
+test-requires = ["pytest", "bitarray", "fsspec"]
+test-command = "pytest {project}/test_compact_tree.py {project}/test_marisa_trie.py -x -q"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+
