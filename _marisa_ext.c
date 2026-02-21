@@ -140,6 +140,17 @@ TrieIndex_init(TrieIndexObject *self, PyObject *args, PyObject *kwds)
             &n_nodes, &total_n, &root_is_terminal))
         return -1;
 
+    /* Overflow guard: the size arithmetic below uses Py_ssize_t (signed) and
+     * size_t.  On 32-bit builds both are only 4 bytes wide, so even a
+     * moderately large n_nodes can overflow.  Reject anything where
+     * (n_nodes+1)*8 would not fit in either type. */
+    if ((uint64_t)n_nodes + 1 > (uint64_t)(PY_SSIZE_T_MAX / 4) ||
+        (uint64_t)n_nodes + 1 > (uint64_t)(SIZE_MAX / 8)) {
+        PyErr_SetString(PyExc_ValueError,
+                        "TrieIndex: n_nodes too large");
+        goto release_all;
+    }
+
     /* Sizes we expect */
     Py_ssize_t node_u32_bytes  = (Py_ssize_t)n_nodes * 4;
     Py_ssize_t csr_u32_bytes   = (Py_ssize_t)(n_nodes + 1) * 4;
@@ -534,6 +545,12 @@ TreeIndex_init(TreeIndexObject *self, PyObject *args, PyObject *kwds)
         goto release_all;
     }
 
+    /* Overflow guard: n_tree_nodes*4 must fit in Py_ssize_t. */
+    if ((uint64_t)n_tree_nodes > (uint64_t)(PY_SSIZE_T_MAX / 4)) {
+        PyErr_SetString(PyExc_ValueError,
+                        "TreeIndex: n_tree_nodes too large");
+        goto release_all;
+    }
     Py_ssize_t node_u32 = (Py_ssize_t)n_tree_nodes * 4;
     if (cs_buf.len != node_u32 || cc_buf.len != node_u32) {
         PyErr_SetString(PyExc_ValueError,
@@ -568,6 +585,14 @@ TreeIndex_init(TreeIndexObject *self, PyObject *args, PyObject *kwds)
         }
     }
 
+    /* Overflow guard for the total malloc size: elbl==vcol and cs==cc
+     * (validated above), so the sum is 2*elbl_len + 2*cs_len.  Check
+     * before computing to avoid Py_ssize_t signed overflow. */
+    if (elbl_buf.len > (PY_SSIZE_T_MAX - cs_buf.len - cc_buf.len) / 2) {
+        PyErr_SetString(PyExc_ValueError,
+                        "TreeIndex: combined buffer sizes overflow");
+        goto release_all;
+    }
     Py_ssize_t total =
         elbl_buf.len + vcol_buf.len + cs_buf.len + cc_buf.len;
 
