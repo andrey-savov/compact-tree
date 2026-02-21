@@ -19,7 +19,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact-name: linux
+            artifact-name: linux-x86_64
+            cibw-archs: x86_64
+          - os: ubuntu-latest
+            artifact-name: linux-aarch64
+            cibw-archs: aarch64
           - os: windows-latest
             artifact-name: windows
           - os: macos-latest
@@ -31,7 +35,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Set up QEMU (Linux aarch64 emulation)
-      if: matrix.os == 'ubuntu-latest'
+      if: matrix.cibw-archs == 'aarch64'
       uses: docker/setup-qemu-action@v3
       with:
         platforms: arm64
@@ -40,6 +44,7 @@ jobs:
       uses: pypa/cibuildwheel@v2.21.3
       env:
         CIBW_BUILD_FRONTEND: "build[uv]"
+        CIBW_ARCHS_LINUX: ${{ matrix.cibw-archs }}
         CIBW_ARCHS_MACOS: ${{ matrix.cibw-archs }}
         CIBW_SKIP: ${{ matrix.cibw-skip }}
 

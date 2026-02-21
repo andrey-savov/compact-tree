@@ -77,7 +77,8 @@ test-requires = ["pytest", "bitarray", "fsspec"]
 test-command = "pytest {project}/test_compact_tree.py {project}/test_marisa_trie.py -x -q"
 
 [tool.cibuildwheel.linux]
-archs = ["x86_64", "aarch64"]
+# archs are set per-runner via CIBW_ARCHS_LINUX in the workflow matrix
+# (two parallel jobs: x86_64 and aarch64)
 
 [tool.cibuildwheel.macos]
 # archs are set per-runner via CIBW_ARCHS_MACOS in the workflow matrix
