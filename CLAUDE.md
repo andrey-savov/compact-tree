@@ -23,8 +23,8 @@ with subtree word counts for minimal perfect hashing (MPH). It provides:
   O(N). On the first call after construction it returns a pre-built mapping
   from the intermediate trie data and frees it immediately; subsequent calls or
   calls on deserialized tries perform a single DFS over the CSR arrays.
-- **O(1) label access**: pre-computed `_label_offsets` array avoids sequential
-  scans when reading edge labels.
+- **O(1) label access**: edge labels are stored directly in the `_node_labels`
+  array, giving constant-time access by node index.
 - **Serialisation**: `to_bytes()` / `from_bytes()` (binary format v2, CSR arrays)
   for embedding inside `CompactTree`'s binary format.
 
@@ -54,14 +54,14 @@ CompactTree
   |
   +-- _child_start : array.array('I')  child start offsets (CSR), one per node
   +-- _child_count : array.array('I')  child counts (CSR), one per node
-  +-- _elbl        : bytes             edge labels (uint32 key ids, 4 bytes/node)
-  +-- _vcol        : bytes             value column (uint32: value id or 0xFFFFFFFF for internal)
+  +-- elbl         : array.array('I')  edge labels (uint32 key ids, one per node)
+  +-- vcol         : array.array('I')  value column (uint32: value id or 0xFFFFFFFF for internal)
   +-- _key_trie    : MarisaTrie        key vocabulary (word <-> dense index)
   +-- _val_trie    : MarisaTrie        value vocabulary (word <-> dense index)
 ```
 
-Each non-root node `v` (0-indexed) occupies a 4-byte slot in both `_elbl`
-(its edge label / key id) and `_vcol` (its value id or the sentinel
+Each non-root node `v` (0-indexed) occupies a slot in both `elbl`
+(its edge label / key id) and `vcol` (its value id or the sentinel
 `0xFFFFFFFF` for internal nodes). Child navigation: `_child_start[v]` is the
 start offset and `_child_count[v]` is the child count for node `v`.
 
@@ -71,10 +71,10 @@ During `MarisaTrie.__init__` two sets of structures coexist briefly:
 
 | Structure | Purpose | Lifetime |
 |---|---|---|
-| `nodes_metadata` (list) | BFS-ordered `(inode, label, is_terminal)` tuples from path-compressed intermediate trie | build only, freed after `_build_trie` returns |
-| `children_map` (dict) | parent-index → child-index list, same BFS order | build only |
-| `_word_to_idx` (dict) | `{word: idx}` built from the above via `_build_word_index_from_intermediate()` | exists from end of `__init__` until first `to_dict()` call; freed immediately after |
-| `_node_labels`, `_node_children`, `_node_counts`, `_node_terminal`, `_label_offsets` | CSR trie for query-time navigation and serialization | permanent (run time + serialization) |
+| `node_labels`, `node_terminal`, `node_children` (locals in `_build_arrays`) | BFS-ordered label/terminal/child-list arrays from path-compressed intermediate trie | build only, freed after `_build_arrays` returns |
+| `children_map` (dict, local in `_build_arrays`) | parent-index → child-index list, same BFS order | build only |
+| `_word_to_idx` (dict) | `{word: idx}` built via `_build_word_index()` | exists from end of `__init__` until first `to_dict()` call; freed immediately after |
+| `_node_labels`, `_node_children`, `_node_counts`, `_node_terminal`, `_root_children` | CSR trie for query-time navigation and serialization | permanent (run time + serialization) |
 | `index` (lru_cache) | per-instance C-level cache wrapping `_index_uncached` | permanent (run time) |
 
 The separation ensures that `_word_to_idx` (a full vocabulary dict, potentially
@@ -93,7 +93,7 @@ from_dict(data, *, vocabulary_size=None)
   |
   +-- MarisaTrie(all_keys, cache_size=key_cache_size)      build key trie
   |     _build_intermediate_trie() -> dict-of-dicts
-  |     _build_trie()          -> CSR arrays + _counts + _word_to_idx (via DFS over nodes_metadata)
+  |     _build_arrays()         -> CSR arrays + _counts + _word_to_idx (via DFS in _build_word_index)
   |
   +-- MarisaTrie(unique_values, cache_size=val_cache_size) build value trie  (same pipeline)
   |

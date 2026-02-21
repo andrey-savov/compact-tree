@@ -282,7 +282,8 @@ def profile_serialize(tree: CompactTree) -> str:
     Returns the temp file path so the caller can feed it to
     :func:`profile_deserialize`.
     """
-    tmp_path = tempfile.mktemp(suffix=".ctree")
+    with tempfile.NamedTemporaryFile(suffix=".ctree", delete=False) as _f:
+        tmp_path = _f.name
 
     # Warmup: also ensures the file exists and fsspec imports are loaded.
     tree.serialize(tmp_path)
@@ -400,7 +401,8 @@ if __name__ == "__main__":
         os.unlink(tmp)
 
     if args.mode == "deserialize":
-        tmp = tempfile.mktemp(suffix=".ctree")
+        with tempfile.NamedTemporaryFile(suffix=".ctree", delete=False) as _f:
+            tmp = _f.name
         print("\nSerializing once (unprofiled) to temp file...")
         tree.serialize(tmp)
         profile_deserialize(tmp)

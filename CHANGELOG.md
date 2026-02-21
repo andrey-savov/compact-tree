@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `CompactTree` binary format (v5): LOUDS bit-vector replaced by a CSR `child_count` array (`array.array('I')`), enabling direct `frombytes` deserialization with no rank/select computation.
 - `MarisaTrie` binary format (v2, carried forward): CSR arrays (`child_count` + `flat_children`) replace LOUDS bits for child-list reconstruction. Deserialization is now 45× faster at L2=173K.
-- `MarisaTrie._root_list` (renamed from `_louds_root_list`): attribute name no longer references LOUDS.
+- `CompactTree._root_list` (renamed from `_louds_root_list`): attribute name no longer references LOUDS.
 - All docstrings updated to remove LOUDS/Poppy/succinct references.
 
 ### Removed

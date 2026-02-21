@@ -106,13 +106,13 @@ CompactTree
   |
   +-- _child_start : array.array('I')  child start offsets (CSR), one per node
   +-- _child_count : array.array('I')  child counts (CSR), one per node
-  +-- _elbl        : bytes             edge labels (uint32 key ids, 4 bytes/node)
-  +-- _vcol        : bytes             value column (uint32: value id or 0xFFFFFFFF for internal nodes)
+  +-- elbl         : array.array('I')  edge labels (uint32 key ids, one per node)
+  +-- vcol         : array.array('I')  value column (uint32: value id or 0xFFFFFFFF for internal nodes)
   +-- _key_trie    : MarisaTrie        key vocabulary (word <-> dense index)
   +-- _val_trie    : MarisaTrie        value vocabulary (word <-> dense index)
 ```
 
-Each non-root node `v` (0-indexed) occupies a 4-byte slot in both `_elbl` (its edge label / key id) and `_vcol` (its value id, or the sentinel `0xFFFFFFFF` for internal nodes).
+Each non-root node `v` (0-indexed) occupies a slot in both `elbl` (its edge label / key id) and `vcol` (its value id, or the sentinel `0xFFFFFFFF` for internal nodes).
 
 Child navigation uses CSR (Compressed Sparse Row) arrays: `_child_start[v]` is the start offset and `_child_count[v]` is the count of children of node `v`.
 

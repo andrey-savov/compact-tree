@@ -204,10 +204,10 @@ class CompactTree:
             _next_cid += degree
             if degree == 0:
                 return
-            # All-leaf fast-path detection: set(map(type, ...)) is a pure
-            # C-level pass — no Python frame per item, unlike any(genexpr).
-            value_types = set(map(type, node.values()))
-            if dict not in value_types:
+            # All-leaf fast-path: check whether any value is a dict
+            # (or dict subclass) using isinstance so subclasses are handled
+            # correctly.
+            if not any(isinstance(v, dict) for v in node.values()):
                 # All children are leaves.  sorted_ids is a cached list[int],
                 # so extend is a C memory copy.  For vcol, build vals as a
                 # concrete list first so the second map() walks a C array
@@ -215,7 +215,7 @@ class CompactTree:
                 # layers (which adds tp_iternext overhead per element).
                 elbl_list.extend(sorted_ids)
                 vals = list(map(node.__getitem__, sorted_keys))
-                if value_types == {str}:
+                if all(type(v) is str for v in vals):
                     vcol_list.extend(map(val_id.__getitem__, vals))
                 else:
                     vcol_list.extend(
@@ -231,7 +231,7 @@ class CompactTree:
             for key in sorted_keys:
                 _elbl(indices[key])
                 child = node[key]
-                if type(child) is dict:
+                if isinstance(child, dict):
                     _vcol(_INTERNAL)
                     if pending_leaves:
                         _queue(pending_leaves)
@@ -318,14 +318,14 @@ class CompactTree:
                 keys_bytes = f.read(keys_len)
                 self._key_trie = MarisaTrie.from_bytes(
                     keys_bytes,
-                    cache_size=_key_vocab_size or None,
+                    cache_size=_key_vocab_size,
                 )
 
                 # Read values MarisaTrie
                 val_bytes = f.read(val_len)
                 self._val_trie = MarisaTrie.from_bytes(
                     val_bytes,
-                    cache_size=_val_vocab_size or None,
+                    cache_size=_val_vocab_size,
                 )
 
                 self._key_vocab_size = _key_vocab_size
@@ -623,14 +623,14 @@ class CompactTree:
         keys_bytes = f.read(keys_len)
         tree._key_trie = MarisaTrie.from_bytes(
             keys_bytes,
-            cache_size=_key_vocab_size or None,
+            cache_size=_key_vocab_size,
         )
 
         # Read values MarisaTrie
         val_bytes = f.read(val_len)
         tree._val_trie = MarisaTrie.from_bytes(
             val_bytes,
-            cache_size=_val_vocab_size or None,
+            cache_size=_val_vocab_size,
         )
 
         tree._key_vocab_size = _key_vocab_size
