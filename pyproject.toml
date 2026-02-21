@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "savov-compact-tree"
-version = "1.2.1"
-description = "Compact, read-only nested dictionary backed by succinct data structures"
+version = "2.0.0"
+description = "Compact, read-only nested dictionary backed by a DAWG-style radix trie"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [
     {name = "Andrey Savov", email = "savov@hotmail.com"}
 ]
-keywords = ["data-structures", "trie", "louds", "dawg", "compression", "compact-tree"]
+keywords = ["data-structures", "trie", "dawg", "compression", "compact-tree"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -28,7 +28,6 @@ classifiers = [
 
 dependencies = [
     "bitarray>=2.0.0",
-    "succinct>=0.0.7",
     "fsspec>=2021.0.0",
 ]
 
@@ -47,7 +46,7 @@ Repository = "https://github.com/andrey-savov/compact-tree"
 Issues = "https://github.com/andrey-savov/compact-tree/issues"
 
 [tool.setuptools]
-py-modules = ["compact_tree", "louds", "marisa_trie"]
+py-modules = ["compact_tree", "marisa_trie"]
 
 [tool.pytest.ini_options]
 testpaths = ["test_compact_tree.py", "test_marisa_trie.py"]
@@ -56,7 +55,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 
 [tool.coverage.run]
-source = ["compact_tree", "louds", "marisa_trie"]
+source = ["compact_tree", "marisa_trie"]
 omit = ["test_*.py"]
 
 [tool.coverage.report]

@@ -4,111 +4,9 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from bitarray import bitarray
 
-from louds import LOUDS
 from compact_tree import CompactTree
-from succinct.poppy import Poppy
 
-
-class TestLOUDS:
-    """Tests for the LOUDS class."""
-
-    def test_louds_first_child_root(self):
-        """Test first_child on root node."""
-        # Create a simple bit vector: 1 (root has child)
-        ba = bitarray('1')
-        louds = LOUDS(Poppy(ba))
-        
-        child = louds.first_child(0)
-        assert child == 1
-
-    def test_louds_first_child_no_children(self):
-        """Test first_child when node has no children."""
-        # Create bit vector: 10 (root has child, that child has no children)
-        ba = bitarray('10')
-        louds = LOUDS(Poppy(ba))
-        
-        child = louds.first_child(0)
-        assert child == 1
-        
-        # Node 1 has no children (next bit is 0)
-        child = louds.first_child(1)
-        assert child is None
-
-    def test_louds_next_sibling(self):
-        """Test next_sibling navigation."""
-        # Create bit vector with multiple siblings: 11 (two children of root)
-        ba = bitarray('11')
-        louds = LOUDS(Poppy(ba))
-        
-        # First child exists
-        child1 = louds.first_child(0)
-        assert child1 == 1
-        
-        # Next sibling should be node 2
-        child2 = louds.next_sibling(1)
-        assert child2 == 2
-
-    def test_louds_no_next_sibling(self):
-        """Test next_sibling returns None when at end."""
-        ba = bitarray('10')
-        louds = LOUDS(Poppy(ba))
-        
-        child = louds.first_child(0)
-        assert child == 1
-        
-        # Node 1 has no next sibling (next bit is 0)
-        next_sib = louds.next_sibling(1)
-        assert next_sib is None
-
-    def test_louds_three_level_tree(self):
-        """Test LOUDS with a 3-level tree structure."""
-        # Build a simple tree with root having 2 children
-        # Bit sequence: 11
-        ba = bitarray('11')
-        louds = LOUDS(Poppy(ba))
-
-        # Root has 2 children
-        assert louds.first_child(0) == 1
-        assert louds.next_sibling(1) == 2
-        assert louds.next_sibling(2) is None
-class TestCompactTreeNode:
-    """Tests for the CompactTree._Node class."""
-
-    def test_node_get_children(self):
-        """Test _Node._children method with real LOUDS."""
-        # Create a LOUDS with 3 children
-        louds_bits = bitarray('111')
-        louds = LOUDS(Poppy(louds_bits))
-        
-        # Get children of root
-        children = []
-        kid = louds.first_child(0)
-        while kid is not None:
-            children.append(kid)
-            kid = louds.next_sibling(kid)
-        
-        assert len(children) == 3
-        assert children == [1, 2, 3]
-
-    def test_node_contains_key(self):
-        """Test _Node.__contains__ logic."""
-        louds_bits = bitarray('11')  # Root with 2 children
-        louds = LOUDS(Poppy(louds_bits))
-        
-        # Get children
-        children = []
-        kid = louds.first_child(0)
-        while kid is not None:
-            children.append(kid)
-            kid = louds.next_sibling(kid)
-        
-        # Both children exist
-        assert len(children) == 2
-        # Check that we can test containment logic
-        assert 0 < len(children)  # At least some children
-        assert 1 < len(children)  # At least 2 children
 
 
 class TestCompactTree:
@@ -144,55 +42,19 @@ class TestCompactTree:
         finally:
             Path(fname).unlink()
 
-    def test_louds_select_zero(self):
-        """Test LOUDS select_zero operation."""
-        # Create bit vector with known select_zero positions
-        ba = bitarray('1001')  # Two 0s at positions 1 and 2
-        louds = LOUDS(Poppy(ba))
-        
-        # Poppy should work with select operations
-        assert isinstance(louds, LOUDS)
-
-    def test_list_children_with_louds_structure(self):
-        """Test _list_children logic with real LOUDS."""
+    def test_list_children_direct_arrays(self):
+        """Test _list_children logic with directly set CSR arrays."""
+        import array
         tree = CompactTree.__new__(CompactTree)
-        
-        # Create LOUDS with root having 3 children
-        louds_bits = bitarray('111')
-        louds = LOUDS(Poppy(louds_bits))
-        tree.louds = louds
-        
+
+        # Root (pos 0): 3 children starting at node 1.
+        # Nodes 1, 2, 3: leaves (0 children).
+        tree._child_start = array.array('I', [1, 0, 0, 0])
+        tree._child_count = array.array('I', [3, 0, 0, 0])
+
         children = tree._list_children(0)
         assert len(children) == 3
         assert children == [1, 2, 3]
-
-    def test_louds_root_children_enumeration(self):
-        """Test enumerating root children with LOUDS."""
-        # Create LOUDS with 2 root children
-        louds_bits = bitarray('11')
-        louds = LOUDS(Poppy(louds_bits))
-        
-        children = []
-        kid = louds.first_child(0)
-        while kid is not None:
-            children.append(kid)
-            kid = louds.next_sibling(kid)
-        
-        assert len(children) == 2
-        assert children == [1, 2]
-
-    def test_louds_no_children(self):
-        """Test node with no children."""
-        louds_bits = bitarray('10')  # Root has child, but child has no children
-        louds = LOUDS(Poppy(louds_bits))
-        
-        # Root has 1 child
-        child = louds.first_child(0)
-        assert child == 1
-        
-        # That child has no children
-        no_child = louds.first_child(1)
-        assert no_child is None
 
 
 class TestNgrams:

@@ -1,45 +1,16 @@
 # compact-tree
 
-Compact, read-only nested dictionary backed by succinct data structures.
-`CompactTree` stores a nested Python `dict` using a LOUDS-encoded trie with
+Compact, read-only nested dictionary backed by a DAWG-style radix trie.
+`CompactTree` stores a nested Python `dict` using a path-compressed radix trie with
 DAWG-style key/value deduplication, enabling low-memory random access and
 efficient serialisation.
 
 ## Key concepts
 
-### LOUDS (Level-Order Unary Degree Sequence)
-
-LOUDS is a succinct tree representation that encodes an ordered tree into a
-single bit string using roughly **2n** bits for **n** nodes (close to the
-information-theoretic minimum).
-
-**Encoding rule:** traverse the tree in breadth-first (level) order. For each
-node, write _d_ `1`-bits (where _d_ is the node's number of children) followed
-by a single `0`-bit. The resulting bit string fully describes the tree topology.
-
-Example -- a root with children A (2 kids) and B (0 kids):
-
-```
-root  ->  1 1 0      (2 children, then 0-terminator)
-A     ->  1 1 0      (2 children)
-B     ->  0           (leaf)
-...
-```
-
-Navigation relies on **rank** and **select** queries over the bit vector:
-
-| Operation        | Formula                                        |
-|------------------|------------------------------------------------|
-| `first_child(v)` | find the (v-1)-th `0`, move one position right; if that bit is `1`, its rank gives the child node id |
-| `next_sibling(v)` | find the `1`-bit for node v (`select(v-1)`), check the next position; if `1`, sibling is `v+1` |
-
-The `LOUDS` class wraps a **Poppy** bit vector (from the `succinct` package)
-which answers rank/select in O(1) time with small overhead.
-
 ### MarisaTrie
 
-`MarisaTrie` is a compact word-to-index mapping built on a LOUDS-encoded trie
-with path compression and minimal perfect hashing (MPH). It provides:
+`MarisaTrie` is a compact word-to-index mapping built on a path-compressed radix trie
+with subtree word counts for minimal perfect hashing (MPH). It provides:
 
 - **Path compression**: single-child edges are merged into one label.
 - **Subtree counting**: enables MPH so every unique word gets a dense index in
@@ -50,13 +21,12 @@ with path compression and minimal perfect hashing (MPH). It provides:
   deserialization time, giving near-zero overhead on cache hits.
 - **Bulk enumeration**: `to_dict()` returns `{word: index}` for every word in
   O(N). On the first call after construction it returns a pre-built mapping
-  from the intermediate trie data (zero LOUDS traversals) and frees it
-  immediately; subsequent calls or calls on deserialized tries perform a single
-  DFS over the LOUDS bit vector.
-- **O(1) label access**: pre-computed `_label_offsets` array avoids sequential
-  scans when reading edge labels.
-- **Serialisation**: `to_bytes()` / `from_bytes()` for embedding inside
-  `CompactTree`'s binary format.
+  from the intermediate trie data and frees it immediately; subsequent calls or
+  calls on deserialized tries perform a single DFS over the CSR arrays.
+- **O(1) label access**: edge labels are stored directly in the `_node_labels`
+  array, giving constant-time access by node index.
+- **Serialisation**: `to_bytes()` / `from_bytes()` (binary format v2, CSR arrays)
+  for embedding inside `CompactTree`'s binary format.
 
 `CompactTree` uses two `MarisaTrie` instances -- one for keys and one for
 values -- replacing the earlier length-prefixed UTF-8 buffers.
@@ -82,16 +52,18 @@ dict are stored once -- while keeping the trie structure simple.
 ```
 CompactTree
   |
-  +-- louds      : LOUDS       bit-vector tree topology (Poppy rank/select)
-  +-- elbl       : bytes       edge labels  (uint32 key ids, 4 bytes per node)
-  +-- vcol       : bytes       value column (uint32: value id or 0xFFFFFFFF for internal nodes)
-  +-- _key_trie  : MarisaTrie  key vocabulary (word <-> dense index)
-  +-- _val_trie  : MarisaTrie  value vocabulary (word <-> dense index)
+  +-- _child_start : array.array('I')  child start offsets (CSR), one per node
+  +-- _child_count : array.array('I')  child counts (CSR), one per node
+  +-- elbl         : array.array('I')  edge labels (uint32 key ids, one per node)
+  +-- vcol         : array.array('I')  value column (uint32: value id or 0xFFFFFFFF for internal)
+  +-- _key_trie    : MarisaTrie        key vocabulary (word <-> dense index)
+  +-- _val_trie    : MarisaTrie        value vocabulary (word <-> dense index)
 ```
 
-Each non-root node `v` (1-indexed) occupies a 4-byte slot at offset
-`(v-1)*4` in both `elbl` (its edge label / key id) and `vcol` (its value id
-or the sentinel `0xFFFFFFFF` for internal nodes).
+Each non-root node `v` (0-indexed) occupies a slot in both `elbl`
+(its edge label / key id) and `vcol` (its value id or the sentinel
+`0xFFFFFFFF` for internal nodes). Child navigation: `_child_start[v]` is the
+start offset and `_child_count[v]` is the child count for node `v`.
 
 ### MarisaTrie internal layout (build time vs. run time)
 
@@ -99,10 +71,10 @@ During `MarisaTrie.__init__` two sets of structures coexist briefly:
 
 | Structure | Purpose | Lifetime |
 |---|---|---|
-| `nodes_metadata` (list) | BFS-ordered `(inode, label, is_terminal)` tuples from path-compressed intermediate trie | build only, freed after `_build_louds` returns |
-| `children_map` (dict) | parent-index → child-index list, same BFS order | build only |
-| `_word_to_idx` (dict) | `{word: idx}` built from the above via `_build_word_index_from_intermediate()` | exists from end of `__init__` until first `to_dict()` call; freed immediately after |
-| `_louds`, `_labels`, `_terminal`, `_counts`, `_label_offsets` | LOUDS trie for query-time navigation and serialization | permanent (run time + serialization) |
+| `node_labels`, `node_terminal`, `node_children` (locals in `_build_arrays`) | BFS-ordered label/terminal/child-list arrays from path-compressed intermediate trie | build only, freed after `_build_arrays` returns |
+| `children_map` (dict, local in `_build_arrays`) | parent-index → child-index list, same BFS order | build only |
+| `_word_to_idx` (dict) | `{word: idx}` built via `_build_word_index()` | exists from end of `__init__` until first `to_dict()` call; freed immediately after |
+| `_node_labels`, `_node_children`, `_node_counts`, `_node_terminal`, `_root_children` | CSR trie for query-time navigation and serialization | permanent (run time + serialization) |
 | `index` (lru_cache) | per-instance C-level cache wrapping `_index_uncached` | permanent (run time) |
 
 The separation ensures that `_word_to_idx` (a full vocabulary dict, potentially
@@ -121,41 +93,40 @@ from_dict(data, *, vocabulary_size=None)
   |
   +-- MarisaTrie(all_keys, cache_size=key_cache_size)      build key trie
   |     _build_intermediate_trie() -> dict-of-dicts
-  |     _build_louds()          -> LOUDS + _counts + _word_to_idx (via DFS over nodes_metadata)
+  |     _build_arrays()         -> CSR arrays + _counts + _word_to_idx (via DFS in _build_word_index)
   |
   +-- MarisaTrie(unique_values, cache_size=val_cache_size) build value trie  (same pipeline)
   |
   +-- key_trie.to_dict()        O(N) pop of _word_to_idx  ->  key_id: dict[str,int]
   +-- val_trie.to_dict()        O(M) pop of _word_to_idx  ->  val_id: dict[str,int]
   |
-  +-- BFS over data             emit LOUDS bits + elbl + vcol
+  +-- BFS over data             emit child_count + elbl + vcol
         _key_order_cache         frozenset-keyed, amortises sort + key_id lookup
                                  across sibling nodes with identical key sets
 ```
 
-Critically, LOUDS rank/select is used only **3 times** during `from_dict`:
-once per `Poppy.__init__` call (one key trie, one value trie, one CompactTree
-LOUDS). All vocabulary lookups during BFS encoding are O(1) plain-dict hits.
+All vocabulary lookups during BFS encoding are O(1) plain-dict hits.
 
-## Binary format (v4)
+## Binary format (v5)
 
 ```
-Magic   : 5 bytes   "CTree"
-Version : 8 bytes   uint64 LE (always 4; v3 files are still readable)
-Header  : 7 x 8 bytes  lengths of: keys, values, louds, vcol, elbl,
-                         key_vocab_size, val_vocab_size
-Payload : keys_bytes | val_bytes | louds_bytes | vcol_bytes | elbl_bytes
+Magic   : 5 bytes    "CTree"
+Version : 8 bytes    uint64 LE  (always 5)
+Header  : 7 × 8 bytes  lengths of: keys_trie, val_trie, child_count,
+                         vcol, elbl, key_vocab_size, val_vocab_size
+Payload : keys_trie_bytes | val_trie_bytes | child_count_bytes
+          | vcol_bytes | elbl_bytes
 ```
 
 `key_vocab_size` and `val_vocab_size` are the effective `lru_cache(maxsize=…)` values
-used for the key and value `MarisaTrie` instances respectively.  They are set during
+used for the key and value `MarisaTrie` instances respectively. They are set during
 `from_dict` (either from the caller-supplied `vocabulary_size` hint or computed
 automatically as `len(all_keys)` / `len(unique_values)`) and restored on every load
 so that query-time caches are immediately correctly sized.
 
-`keys_bytes` and `val_bytes` are serialised `MarisaTrie` instances (see
-`MarisaTrie.to_bytes()`). `louds_bytes` is the raw bitarray, `vcol_bytes` and
-`elbl_bytes` are packed uint32 arrays.
+`keys_trie_bytes` and `val_trie_bytes` are serialised `MarisaTrie` instances (CSR
+format, v2). `child_count_bytes`, `vcol_bytes`, and `elbl_bytes` are packed uint32
+arrays. Files written in v4 or earlier (LOUDS-based) are not supported.
 
 ## Usage
 
@@ -195,6 +166,5 @@ tree.to_dict()
 
 ## Dependencies
 
-- `bitarray` -- mutable bit arrays
-- `succinct` (Poppy) -- rank/select in O(1)
+- `bitarray` -- bit-packed boolean arrays (terminal flags in MarisaTrie serialization)
 - `fsspec` -- filesystem abstraction for local and remote storage

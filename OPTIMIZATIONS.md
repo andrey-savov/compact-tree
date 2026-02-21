@@ -15,6 +15,8 @@ This document tracks all performance optimizations made to the `compact_tree` an
   - [Optimization #7: Bulk Vocabulary Enumeration via to_dict()](#optimization-7-bulk-vocabulary-enumeration-via-to_dict)
   - [Optimization #8: Intermediate-Trie Word Index (eliminate LOUDS during build)](#optimization-8-intermediate-trie-word-index)
   - [Combined Impact v1.2.0](#combined-impact-v120)
+  - [Optimization #9: LOUDS Removal — CSR Binary Format](#optimization-9-louds-removal--csr-binary-format)
+  - [Combined Impact v2.0.0](#combined-impact-v200)
 - [Potential Future Optimizations](#potential-future-optimizations)
 - [Measurement Tools](#measurement-tools)
 - [Optimization Guidelines](#optimization-guidelines)
@@ -348,6 +350,29 @@ if cached is not None:
 
 ---
 
+### Optimization #9: LOUDS Removal — CSR Binary Format
+
+**Date:** 2026-02-20  
+**Components:** MarisaTrie + CompactTree
+
+**Problem:**  
+`marisa_trie.from_bytes` was the dominant deserialize bottleneck at scale: each deserialization reconstructed child lists via LOUDS rank/select (one `select_zero` + `rank` chain per node), plus a tight per-node loop calling `struct.unpack`, `bytes.decode`, and 3× `list.append`. At L2=173K, two trie deserializations consumed ~310ms of a ~999ms total deserialize time.
+
+**Solution:**  
+Replace the LOUDS bit-vector child encoding in both `MarisaTrie` (format v2) and `CompactTree` (format v5) with CSR arrays (`child_count` + `flat_children`). Child-list reconstruction is now a single `array.frombytes()` call — no rank/select, no per-node unpacking. The `succinct` package and `louds.py` module were removed entirely.
+
+**Results (L2=10,000):**
+
+| Metric | Before (LOUDS) | After (CSR) |
+|---|---|---|
+| MarisaTrie.from_bytes (total) | ~8.1s | ~0.18s |
+| Deserialize throughput | ~14.8/s | 13.6/s (I/O now dominates) |
+| Dependencies | bitarray, succinct, fsspec | bitarray, fsspec |
+
+**Also removed:** `succinct` package dependency, `louds.py` module, CompactTree v3/v4 read compatibility.
+
+---
+
 ### Combined Impact v1.2.0
 
 **Benchmark:** 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries, vocabulary from corpus n-gram permutations (N=1..7, ~4.4M unique strings).
@@ -368,6 +393,23 @@ if cached is not None:
 | `_walk_dict` | 4.3s | 16% | 6.2M leaf visits |
 | `MarisaTrie.__init__` ×2 | 3.9s | 15% | trie build + LOUDS construction |
 
+### Combined Impact v2.0.0
+
+**Benchmark:** 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries.
+
+| Metric | v2.0.0 |
+|---|---|
+| `from_dict` build time | 7.3s |
+| Lookup throughput | 67,889/s (14.7 µs/lookup) |
+| Serialize | 14.0/s (71.6 ms), 77.2 MiB |
+| Deserialize | 1.0/s (999 ms) |
+
+**Remaining bottleneck:** deserialization at 173K is dominated by I/O + `array.frombytes` over 77 MiB. No rank/select remains anywhere in the hot paths.
+
+---
+
+## Potential Future Optimizations
+
 ### 1. Batch BFS Buffer Writes
 
 **Idea:**  
@@ -375,14 +417,7 @@ Pre-allocate `vcol_buf` and `elbl_buf` as `array.array('I', [0] * total_nodes)` 
 
 **Estimated impact:** 30–50% reduction in `_emit_children` time (~4–7s saving at 173K)
 
-### 2. Compiled rank/select (gmpy2 or C extension)
-
-**Idea:**  
-Replace pure-Python `succinct.poppy` rank/select with compiled popcount. Even after Optimization #8, 406K `bits.popcount` calls remain (for `Poppy.__init__` during trie construction). A C-level `__builtin_popcountll` would reduce those to near-zero.
-
-**Estimated impact:** Minor at current scale; significant only if LOUDS DFS fallback (deserialization path) is on the critical path.
-
-### 3. Cython/PyPy Compilation of hot BFS loop
+### 2. Cython/PyPy Compilation of hot BFS loop
 
 **Idea:**  
 Compile `_emit_children` and `_walk_dict` with Cython. At 6.2M leaves, Python dispatch overhead dominates these loops.

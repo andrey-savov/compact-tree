@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-02-20
+
+### Breaking Changes
+
+- Binary format bumped from **v4 to v5**. Files written by v1.x are no longer readable.
+- Removed `succinct` dependency entirely. The `louds.py` module is gone.
+
+### Changed
+
+- `CompactTree` binary format (v5): LOUDS bit-vector replaced by a CSR `child_count` array (`array.array('I')`), enabling direct `frombytes` deserialization with no rank/select computation.
+- `MarisaTrie` binary format (v2, carried forward): CSR arrays (`child_count` + `flat_children`) replace LOUDS bits for child-list reconstruction. Deserialization is now 45× faster at L2=173K.
+- `CompactTree._root_list` (renamed from `_louds_root_list`): attribute name no longer references LOUDS.
+- All docstrings updated to remove LOUDS/Poppy/succinct references.
+
+### Removed
+
+- `louds.py` module.
+- `succinct` package dependency.
+- MarisaTrie v1 (LOUDS-based) read compatibility — `from_bytes` raises `AssertionError` on non-v2 data.
+- CompactTree v3/v4 read compatibility — `__init__` raises `AssertionError` on non-v5 data.
+
+### Performance (L2=173,000, 6.2M leaf entries, 77 MiB file)
+
+| Metric | v2.0.0 |
+|---|---|
+| `from_dict` build time | 7.3s |
+| Lookup throughput | 67,889/s (14.7 µs/lookup) |
+| Serialize | 14.0/s (71.6 ms) |
+| Deserialize | 1.0/s (999 ms) |
+
 ## [1.2.1] - 2026-02-20
 
 ### Fixed
@@ -121,7 +151,10 @@ Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entr
 - succinct >= 0.0.7
 - fsspec >= 2021.0.0
 
-[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/andrey-savov/compact-tree/compare/v1.2.1...v2.0.0
+[1.2.1]: https://github.com/andrey-savov/compact-tree/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/andrey-savov/compact-tree/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/andrey-savov/compact-tree/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/andrey-savov/compact-tree/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/andrey-savov/compact-tree/compare/v0.2.0...v0.3.0
