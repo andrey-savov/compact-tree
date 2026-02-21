@@ -404,12 +404,18 @@ class MarisaTrie:
     def to_bytes(self) -> bytes:
         """Serialize the trie to bytes.
 
+        Result is cached on the instance after the first call — the trie is
+        immutable so the bytes never change.
+
         LOUDS is constructed on the fly from the in-memory arrays (which are
         already in BFS order) and is **not** stored back on the instance.
 
         Returns:
             Binary representation of the trie.
         """
+        cached = self.__dict__.get("_cached_bytes")
+        if cached is not None:
+            return cached
         import io
 
         num_nodes = len(self._node_labels)
@@ -457,7 +463,9 @@ class MarisaTrie:
         buf.write(labels_bytes)
         buf.write(terminal_bytes)
         buf.write(counts_bytes)
-        return buf.getvalue()
+        result = buf.getvalue()
+        self._cached_bytes = result
+        return result
 
     @classmethod
     def from_bytes(
