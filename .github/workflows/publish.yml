@@ -13,22 +13,34 @@ on:
 
 jobs:
   build-wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: Build wheels (${{ matrix.artifact-name }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact-name: linux
+          - os: windows-latest
+            artifact-name: windows
+          - os: macos-13
+            artifact-name: macos-x86_64
+            cibw-archs: x86_64
+          - os: macos-latest
+            artifact-name: macos-arm64
+            cibw-archs: arm64
 
     steps:
     - uses: actions/checkout@v4
 
     - name: Build wheels
       uses: pypa/cibuildwheel@v2.21.3
+      env:
+        CIBW_ARCHS_MACOS: ${{ matrix.cibw-archs }}
 
     - name: Upload wheel artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: python-package-distributions-${{ matrix.os }}
+        name: python-package-distributions-${{ matrix.artifact-name }}
         path: wheelhouse/
 
   build-sdist:
@@ -78,6 +90,8 @@ jobs:
 
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        verbose: true
 
   publish-to-testpypi:
     name: Publish to Test PyPI
@@ -102,3 +116,4 @@ jobs:
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         repository-url: https://test.pypi.org/legacy/
+        verbose: true
