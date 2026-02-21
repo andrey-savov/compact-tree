@@ -569,6 +569,38 @@ class CompactTree:
             raise KeyError(key)
         return self._resolve(child_pos)
 
+    def get_path(self, *keys: str) -> Any:
+        """Look up a value by traversing multiple levels in a single call.
+
+        Equivalent to ``tree[k0][k1]...[kN]`` but descends all levels
+        inside a single C call when the extension is available, avoiding
+        per-level Python overhead and intermediate ``_Node`` allocations.
+
+        Args:
+            *keys: One key per level of the tree to traverse.
+
+        Returns:
+            The leaf value string, or a sub-tree ``_Node`` if the path
+            ends at an internal node.
+
+        Raises:
+            KeyError: If any key along the path is not found.
+            TypeError: If no keys are supplied.
+        """
+        if not keys:
+            raise TypeError("get_path requires at least one key")
+        ct = self._c_tree
+        if ct is not None:
+            result = ct.get_path(0, *keys)
+            if type(result) is int:
+                return CompactTree._Node(self, result)
+            return result
+        # Pure-Python fallback: chain [] lookups.
+        node: Any = self
+        for key in keys:
+            node = node[key]
+        return node
+
     def __iter__(self) -> Iterator[str]:
         for kid in self._root_list:
             yield self._key_trie.restore_key(self.elbl[kid - 1])

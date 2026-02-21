@@ -220,8 +220,10 @@ def _print_profile_stats(
 
 def profile_lookup(tree: CompactTree, d: dict,
                    duration: float = 10.0,
-                   miss_ratio: float = 0.1) -> None:
-    """Profile random leaf lookups on *tree* for approximately *duration* seconds.
+                   miss_ratio: float = 0.1,
+                   use_get_path: bool = False,
+                   use_dict: bool = False) -> None:
+    """Profile random leaf lookups on *tree* (or *d*) for approximately *duration* seconds.
 
     Key generation is O(1) per lookup: precompute the small key lists for
     each level, then use ``rng.randrange(len(keys))`` + direct list indexing
@@ -229,6 +231,9 @@ def profile_lookup(tree: CompactTree, d: dict,
 
     ``miss_ratio`` fraction of lookups intentionally use a key from the wrong
     level (guaranteed miss) to exercise the KeyError / __contains__ path.
+
+    When *use_dict* is True the benchmark runs against the plain Python dict
+    *d* instead of the CompactTree, giving a direct baseline comparison.
     """
     # Extract key lists once — tiny: 9, 4, 173K entries.
     l0_keys = list(d.keys())
@@ -239,14 +244,17 @@ def profile_lookup(tree: CompactTree, d: dict,
     n0, n1, n2 = len(l0_keys), len(l1_keys), len(l2_keys)
     print(f"\nKey lists: L0={n0}, L1={n1}, L2={n2:,}")
 
-    # Warmup: prime lru_cache on all three key levels (skip if cache disabled).
-    cache_disabled = getattr(tree, '_key_vocab_size', None) == 0
-    if cache_disabled:
-        print("  Cache disabled (vocab_size=0) — skipping warmup, profiling _index_uncached directly")
+    # Warmup: prime lru_cache on all three key levels (skip if cache/dict mode).
+    if use_dict:
+        print("  Using plain Python dict — no warmup needed")
     else:
-        for _ in range(2_000):
-            _ = tree[l0_keys[_ % n0]]
-        print("  Warmed up")
+        cache_disabled = getattr(tree, '_key_vocab_size', None) == 0
+        if cache_disabled:
+            print("  Cache disabled (vocab_size=0) — skipping warmup, profiling _index_uncached directly")
+        else:
+            for _ in range(2_000):
+                _ = tree[l0_keys[_ % n0]]
+            print("  Warmed up")
 
     rng = random.Random(42)
     profiler = cProfile.Profile()
@@ -266,11 +274,21 @@ def profile_lookup(tree: CompactTree, d: dict,
                 # Guaranteed miss: swap k2 for a key from the wrong level.
                 k2 = l0_keys[rng.randrange(n0)]
                 try:
-                    _ = tree[k0][k1][k2]
+                    if use_dict:
+                        _ = d[k0][k1][k2]
+                    elif use_get_path:
+                        _ = tree.get_path(k0, k1, k2)
+                    else:
+                        _ = tree[k0][k1][k2]
                 except KeyError:
                     pass
             else:
-                _ = tree[k0][k1][k2]
+                if use_dict:
+                    _ = d[k0][k1][k2]
+                elif use_get_path:
+                    _ = tree.get_path(k0, k1, k2)
+                else:
+                    _ = tree[k0][k1][k2]
         n_iters += CHECK_INTERVAL
         if time.perf_counter() - wall_start >= duration:
             break
@@ -389,6 +407,20 @@ if __name__ == "__main__":
         help="Number of L2 keys (default: 10000 for serde modes, 173000 otherwise)",
     )
     parser.add_argument(
+        "--use-get-path",
+        action="store_true",
+        default=False,
+        dest="use_get_path",
+        help="Use tree.get_path(k0,k1,k2) instead of tree[k0][k1][k2] in the lookup benchmark",
+    )
+    parser.add_argument(
+        "--use-dict",
+        action="store_true",
+        default=False,
+        dest="use_dict",
+        help="Benchmark the plain Python dict instead of CompactTree (baseline comparison)",
+    )
+    parser.add_argument(
         "--vocab-size",
         type=int,
         default=None,
@@ -419,7 +451,9 @@ if __name__ == "__main__":
         print(f"  Built in {time.perf_counter() - t0:.3f}s")
 
     if args.mode in ("lookup", "both"):
-        profile_lookup(tree, d, duration=args.lookup_duration)
+        profile_lookup(tree, d, duration=args.lookup_duration,
+                       use_get_path=args.use_get_path,
+                       use_dict=args.use_dict)
 
     if args.mode in ("serialize", "serde"):
         tmp = profile_serialize(tree)

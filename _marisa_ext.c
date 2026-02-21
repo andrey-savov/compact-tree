@@ -621,6 +621,75 @@ TreeIndex_find(TreeIndexObject *self, PyObject *args)
 }
 
 /* ------------------------------------------------------------------ */
+/* TreeIndex.get_path(node_pos, key1, key2, ...) -> int | str          */
+/* ------------------------------------------------------------------ */
+/*
+ * Traverses all keys in a single C call, avoiding per-level Python
+ * round-trips.  Returns child_pos (int) if the last key resolves to an
+ * internal node, or the leaf value string.  Raises KeyError on any miss.
+ */
+static PyObject *
+TreeIndex_get_path(TreeIndexObject *self, PyObject *args)
+{
+    Py_ssize_t nargs = PyTuple_GET_SIZE(args);
+    if (nargs < 2) {
+        PyErr_SetString(PyExc_TypeError,
+                        "get_path requires node_pos plus at least one key");
+        return NULL;
+    }
+
+    unsigned long upos =
+        PyLong_AsUnsignedLong(PyTuple_GET_ITEM(args, 0));
+    if (upos == (unsigned long)-1 && PyErr_Occurred())
+        return NULL;
+    uint32_t pos = (uint32_t)upos;
+
+    Py_ssize_t last = nargs - 1;
+    for (Py_ssize_t i = 1; i <= last; i++) {
+        PyObject *key = PyTuple_GET_ITEM(args, i);
+
+        /* key -> key_id */
+        uint32_t key_id = tree_key_to_id(self->key_trie, key);
+        if (key_id == UINT32_MAX)
+            return NULL;   /* KeyError already set */
+
+        /* binary-search children of pos */
+        uint32_t count = self->child_count[pos];
+        if (count == 0) {
+            PyErr_SetObject(PyExc_KeyError, key);
+            return NULL;
+        }
+        uint32_t lo  = self->child_start[pos] - 1;
+        uint32_t idx = tree_bisect(self->elbl, lo, lo + count, key_id);
+        if (idx == UINT32_MAX) {
+            PyErr_SetObject(PyExc_KeyError, key);
+            return NULL;
+        }
+        uint32_t child_pos = idx + 1;
+
+        if (i == last) {
+            /* Last key: return leaf string or child_pos for internal nodes */
+            uint32_t vv = self->vcol[child_pos - 1];
+            if (vv == TREE_INTERNAL)
+                return PyLong_FromUnsignedLong(child_pos);
+            PyObject *vid_obj = PyLong_FromUnsignedLong(vv);
+            if (!vid_obj) return NULL;
+            PyObject *result = PyObject_CallOneArg(self->val_restore, vid_obj);
+            Py_DECREF(vid_obj);
+            return result;
+        }
+
+        /* Intermediate key: node must be internal to descend */
+        if (self->vcol[child_pos - 1] != TREE_INTERNAL) {
+            PyErr_SetObject(PyExc_KeyError, key);
+            return NULL;
+        }
+        pos = child_pos;
+    }
+    Py_RETURN_NONE;  /* unreachable */
+}
+
+/* ------------------------------------------------------------------ */
 /* TreeIndex method table + type                                       */
 /* ------------------------------------------------------------------ */
 
@@ -632,6 +701,11 @@ static PyMethodDef TreeIndex_methods[] = {
     {"find", (PyCFunction)TreeIndex_find, METH_VARARGS,
      "find(node_pos, key) -> int\n\n"
      "Like get() but returns -1 on miss instead of raising KeyError."},
+    {"get_path", (PyCFunction)TreeIndex_get_path, METH_VARARGS,
+     "get_path(node_pos, key1, key2, ...) -> int | str\n\n"
+     "Traverse all keys in a single C call.  Returns child_pos (int) for\n"
+     "an internal final node, or the leaf value string.  Raises KeyError\n"
+     "on any miss."},
     {NULL, NULL, 0, NULL}
 };
 
