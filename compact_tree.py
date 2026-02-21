@@ -7,6 +7,11 @@ from typing import Any, BinaryIO, Iterator, Optional
 
 from marisa_trie import MarisaTrie
 
+try:
+    from _marisa_ext import TreeIndex as _TreeIndex
+except ImportError:
+    _TreeIndex = None  # type: ignore[assignment,misc]
+
 _INTERNAL = 0xFFFFFFFF  # vcol sentinel for internal (non-leaf) nodes
 
 
@@ -281,6 +286,7 @@ class CompactTree:
         tree.vcol = _vcol_arr
         tree.elbl = _elbl_arr
         tree._root_list = tree._list_children(0)
+        tree._attach_c_tree()
         return tree
 
     # ------------------------------------------------------------------ #
@@ -353,6 +359,7 @@ class CompactTree:
         self.mm = None
 
         self._root_list = self._list_children(0)
+        self._attach_c_tree()
 
     # ------------------------------------------------------------------ #
     #  serialize                                                           #
@@ -427,6 +434,25 @@ class CompactTree:
     #  Internal helpers                                                    #
     # ------------------------------------------------------------------ #
 
+    def _attach_c_tree(self) -> None:
+        """Build a C-level TreeIndex for fast single-call get/find."""
+        if _TreeIndex is None:
+            self._c_tree = None
+            return
+        c_index = getattr(self._key_trie, '_c_index', None)
+        if c_index is None:
+            self._c_tree = None
+            return
+        self._c_tree = _TreeIndex(
+            elbl        = self.elbl.tobytes(),
+            vcol        = self.vcol.tobytes(),
+            child_start = self._child_start.tobytes(),
+            child_count = self._child_count.tobytes(),
+            n_tree_nodes = len(self._child_start),
+            key_trie    = c_index,
+            val_restore = self._val_trie.restore_key,
+        )
+
     def _vid_to_str(self, vid: int) -> str:
         """Convert a value ID to the corresponding string."""
         return self._val_trie.restore_key(vid)
@@ -474,6 +500,12 @@ class CompactTree:
             return self.tree._list_children(self.pos)
 
         def __getitem__(self, key: str) -> Any:
+            ct = self.tree._c_tree
+            if ct is not None:
+                result = ct.get(self.pos, key)
+                if type(result) is int:
+                    return CompactTree._Node(self.tree, result)
+                return result
             try:
                 key_vid = self.tree._key_trie[key]
             except KeyError:
@@ -488,6 +520,9 @@ class CompactTree:
                 yield self.tree._key_trie.restore_key(self.tree.elbl[kid - 1])
 
         def __contains__(self, key: str) -> bool:
+            ct = self.tree._c_tree
+            if ct is not None:
+                return ct.find(self.pos, key) >= 0
             try:
                 key_vid = self.tree._key_trie[key]
             except KeyError:
@@ -519,6 +554,12 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     def __getitem__(self, key: str) -> Any:
+        ct = self._c_tree
+        if ct is not None:
+            result = ct.get(0, key)
+            if type(result) is int:
+                return CompactTree._Node(self, result)
+            return result
         try:
             key_vid = self._key_trie[key]
         except KeyError:
@@ -528,11 +569,46 @@ class CompactTree:
             raise KeyError(key)
         return self._resolve(child_pos)
 
+    def get_path(self, *keys: str) -> Any:
+        """Look up a value by traversing multiple levels in a single call.
+
+        Equivalent to ``tree[k0][k1]...[kN]`` but descends all levels
+        inside a single C call when the extension is available, avoiding
+        per-level Python overhead and intermediate ``_Node`` allocations.
+
+        Args:
+            *keys: One key per level of the tree to traverse.
+
+        Returns:
+            The leaf value string, or a sub-tree ``_Node`` if the path
+            ends at an internal node.
+
+        Raises:
+            KeyError: If any key along the path is not found.
+            TypeError: If no keys are supplied.
+        """
+        if not keys:
+            raise TypeError("get_path requires at least one key")
+        ct = self._c_tree
+        if ct is not None:
+            result = ct.get_path(0, *keys)
+            if type(result) is int:
+                return CompactTree._Node(self, result)
+            return result
+        # Pure-Python fallback: chain [] lookups.
+        node: Any = self
+        for key in keys:
+            node = node[key]
+        return node
+
     def __iter__(self) -> Iterator[str]:
         for kid in self._root_list:
             yield self._key_trie.restore_key(self.elbl[kid - 1])
 
     def __contains__(self, key: str) -> bool:
+        ct = self._c_tree
+        if ct is not None:
+            return ct.find(0, key) >= 0
         try:
             key_vid = self._key_trie[key]
         except KeyError:
@@ -658,4 +734,5 @@ class CompactTree:
         tree.mm = None
 
         tree._root_list = tree._list_children(0)
+        tree._attach_c_tree()
         return tree

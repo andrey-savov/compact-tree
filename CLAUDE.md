@@ -25,6 +25,14 @@ with subtree word counts for minimal perfect hashing (MPH). It provides:
   calls on deserialized tries perform a single DFS over the CSR arrays.
 - **O(1) label access**: edge labels are stored directly in the `_node_labels`
   array, giving constant-time access by node index.
+- **Navigation tables**: `_first_char_maps`, `_prefix_counts`, and
+  `_node_label_lens` are built by `_build_navigation_tables()` immediately after
+  the CSR arrays are finalized, enabling O(1) child dispatch and MPH index
+  accumulation without inner loops.
+- **Optional C extension** (`TrieIndex`): `_build_c_index()` packs all trie
+  arrays into flat byte buffers and sets `self._c_index` to a `TrieIndex`
+  object from `_marisa_ext`. Provides ~5–10× faster uncached lookups. No-ops
+  silently when the extension is not compiled.
 - **Serialisation**: `to_bytes()` / `from_bytes()` (binary format v2, CSR arrays)
   for embedding inside `CompactTree`'s binary format.
 
@@ -58,7 +66,14 @@ CompactTree
   +-- vcol         : array.array('I')  value column (uint32: value id or 0xFFFFFFFF for internal)
   +-- _key_trie    : MarisaTrie        key vocabulary (word <-> dense index)
   +-- _val_trie    : MarisaTrie        value vocabulary (word <-> dense index)
+  +-- _c_tree      : TreeIndex | None  optional C-level traversal helper
 ```
+
+`_c_tree` is a `TreeIndex` (from `_marisa_ext`) built by `_attach_c_tree()` after
+construction, deserialization, and unpickling. It holds references to the packed
+byte buffers of `elbl`, `vcol`, `_child_start`, `_child_count`, and the key
+trie's `_c_index` (`TrieIndex`). When present, `__getitem__`, `__contains__`,
+and `get_path()` at both root and `_Node` level delegate entirely to C.
 
 Each non-root node `v` (0-indexed) occupies a slot in both `elbl`
 (its edge label / key id) and `vcol` (its value id or the sentinel
@@ -75,6 +90,8 @@ During `MarisaTrie.__init__` two sets of structures coexist briefly:
 | `children_map` (dict, local in `_build_arrays`) | parent-index → child-index list, same BFS order | build only |
 | `_word_to_idx` (dict) | `{word: idx}` built via `_build_word_index()` | exists from end of `__init__` until first `to_dict()` call; freed immediately after |
 | `_node_labels`, `_node_children`, `_node_counts`, `_node_terminal`, `_root_children` | CSR trie for query-time navigation and serialization | permanent (run time + serialization) |
+| `_node_label_lens`, `_first_char_maps`, `_prefix_counts` | navigation tables for O(1) child dispatch and MPH accumulation in C index build | permanent (run time) |
+| `_c_index` (`TrieIndex`) | C-level trie lookup helper; set by `_build_c_index()` | permanent (run time, if extension built) |
 | `index` (lru_cache) | per-instance C-level cache wrapping `_index_uncached` | permanent (run time) |
 
 The separation ensures that `_word_to_idx` (a full vocabulary dict, potentially
@@ -94,6 +111,8 @@ from_dict(data, *, vocabulary_size=None)
   +-- MarisaTrie(all_keys, cache_size=key_cache_size)      build key trie
   |     _build_intermediate_trie() -> dict-of-dicts
   |     _build_arrays()         -> CSR arrays + _counts + _word_to_idx (via DFS in _build_word_index)
+  |     _build_navigation_tables()  -> _node_label_lens + _first_char_maps + _prefix_counts
+  |     _build_c_index()            -> _c_index (TrieIndex) if _marisa_ext is available
   |
   +-- MarisaTrie(unique_values, cache_size=val_cache_size) build value trie  (same pipeline)
   |
@@ -103,6 +122,8 @@ from_dict(data, *, vocabulary_size=None)
   +-- BFS over data             emit child_count + elbl + vcol
         _key_order_cache         frozenset-keyed, amortises sort + key_id lookup
                                  across sibling nodes with identical key sets
+  |
+  +-- _attach_c_tree()          build TreeIndex from _c_index + CSR arrays (if extension available)
 ```
 
 All vocabulary lookups during BFS encoding are O(1) plain-dict hits.
@@ -162,6 +183,9 @@ tree4 = pickle.loads(data)
 
 # Materialise back to plain dict
 tree.to_dict()
+
+# Multi-level lookup in one call (uses C extension when available)
+tree.get_path("a", "x")   # equivalent to tree["a"]["x"]
 ```
 
 ## Dependencies

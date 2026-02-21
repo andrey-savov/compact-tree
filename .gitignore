@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+*.pyd
+compile_commands.json
 
 # Distribution / packaging
 .Python

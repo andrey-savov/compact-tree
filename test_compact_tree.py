@@ -961,6 +961,111 @@ class TestLoadPerformance:
         assert delta_mb < 100, f"Memory usage too high: {delta_mb:.1f}MB"
 
 
+class TestUnicodeAndBoundsSafety:
+    """Regression tests for Unicode first-byte collisions and C bounds checks."""
+
+    def test_unicode_keys_shared_leading_utf8_byte(self):
+        """CompactTree lookup must work for keys whose first UTF-8 byte collides.
+
+        Characters é, ê, è, à all start with 0xC3 in UTF-8.  The C extension
+        must scan the full equal-range rather than stopping at the first match.
+        """
+        data = {"é": "a", "ê": "b", "è": "c", "à": "d"}
+        tree = CompactTree.from_dict(data)
+        for k, v in data.items():
+            assert tree[k] == v, f"Wrong value for key {k!r}"
+            assert k in tree
+
+    def test_unicode_keys_nested_shared_first_byte(self):
+        """Nested CompactTree with Unicode keys sharing first UTF-8 byte."""
+        data = {"root": {"é": "1", "ê": "2", "è": "3"}}
+        tree = CompactTree.from_dict(data)
+        assert tree["root"]["é"] == "1"
+        assert tree["root"]["ê"] == "2"
+        assert tree["root"]["è"] == "3"
+
+    def test_get_path_unicode(self):
+        """get_path should also work with Unicode keys that share first UTF-8 byte."""
+        data = {"root": {"é": "1", "ê": "2"}}
+        tree = CompactTree.from_dict(data)
+        assert tree.get_path("root", "é") == "1"
+        assert tree.get_path("root", "ê") == "2"
+
+    def test_tree_index_bounds_validation_rejects_bad_child_start(self):
+        """TreeIndex.__init__ must raise ValueError for out-of-bounds child_start."""
+        try:
+            from _marisa_ext import TreeIndex, TrieIndex  # noqa: PLC0415
+        except ImportError:
+            pytest.skip("C extension not available")
+
+        import array as _array
+
+        # Build a minimal valid TrieIndex (single word "a")
+        label_bytes = b"a"
+        label_off_a = _array.array("I", [0])
+        label_len_a = _array.array("I", [1])
+        is_terminal = bytes([1])
+        ch_start_a  = _array.array("I", [0, 0])   # node 0 and virtual root: no children
+        ch_cnt_a    = _array.array("I", [0, 0])
+        key_trie = TrieIndex(
+            label_bytes=label_bytes, label_off=label_off_a.tobytes(),
+            label_len=label_len_a.tobytes(), is_terminal=is_terminal,
+            ch_start=ch_start_a.tobytes(), ch_cnt=ch_cnt_a.tobytes(),
+            ch_first_byte=b"", ch_node_id=b"", ch_pfx_count=b"",
+            n_nodes=1, total_n=1, root_is_terminal=0,
+        )
+
+        # Build a TreeIndex where child_start[0] points beyond the elbl array
+        elbl   = _array.array("I", [0, 1])   # 2 entries (n_elbl = 2)
+        vcol   = _array.array("I", [0xFFFFFFFF, 0xFFFFFFFF])
+        # child_start[0] = 99 with child_count[0] = 1 → out of bounds
+        cs     = _array.array("I", [99, 0])
+        cc     = _array.array("I", [1,  0])
+
+        with pytest.raises(ValueError, match="child_start/count out of elbl bounds"):
+            TreeIndex(
+                elbl=elbl.tobytes(), vcol=vcol.tobytes(),
+                child_start=cs.tobytes(), child_count=cc.tobytes(),
+                n_tree_nodes=2, key_trie=key_trie, val_restore=str,
+            )
+
+    def test_tree_index_get_out_of_range_node_raises(self):
+        """TreeIndex.get with an out-of-range node_pos must raise IndexError."""
+        try:
+            from _marisa_ext import TreeIndex, TrieIndex  # noqa: PLC0415
+        except ImportError:
+            pytest.skip("C extension not available")
+
+        import array as _array
+
+        # Single-word trie "a"
+        label_bytes = b"a"
+        label_off_a = _array.array("I", [0])
+        label_len_a = _array.array("I", [1])
+        is_terminal = bytes([1])
+        ch_start_a  = _array.array("I", [0, 0])
+        ch_cnt_a    = _array.array("I", [0, 0])
+        key_trie = TrieIndex(
+            label_bytes=label_bytes, label_off=label_off_a.tobytes(),
+            label_len=label_len_a.tobytes(), is_terminal=is_terminal,
+            ch_start=ch_start_a.tobytes(), ch_cnt=ch_cnt_a.tobytes(),
+            ch_first_byte=b"", ch_node_id=b"", ch_pfx_count=b"",
+            n_nodes=1, total_n=1, root_is_terminal=0,
+        )
+
+        elbl = _array.array("I", [0])
+        vcol = _array.array("I", [0xFFFFFFFF])
+        cs   = _array.array("I", [0, 0])   # root + 1 node
+        cc   = _array.array("I", [0, 0])
+        ti = TreeIndex(
+            elbl=elbl.tobytes(), vcol=vcol.tobytes(),
+            child_start=cs.tobytes(), child_count=cc.tobytes(),
+            n_tree_nodes=2, key_trie=key_trie, val_restore=str,
+        )
+        with pytest.raises((IndexError, KeyError)):
+            ti.get(999, "a")   # node_pos 999 >> n_tree_nodes=2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
