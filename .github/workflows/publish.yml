@@ -25,7 +25,7 @@ jobs:
           - os: macos-latest
             artifact-name: macos
             cibw-archs: arm64 x86_64
-            cibw-skip: cp39-macosx_arm64
+            cibw-skip: cp39-macosx_*
 
     steps:
     - uses: actions/checkout@v4
