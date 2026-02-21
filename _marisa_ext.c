@@ -45,22 +45,44 @@ typedef struct {
     int       root_is_terminal;
     uint32_t  total_children;
 
-    /* Pointers into a single contiguous backing allocation (mem). */
-    const uint8_t  *label_bytes;    /* flat UTF-8 label bytes             */
-    const uint32_t *label_off;      /* label_bytes offset per node        */
-    const uint32_t *label_len;      /* byte length of label per node      */
-    const uint8_t  *is_terminal;    /* 1 if terminal, per node            */
+    /* Pointers into a single contiguous backing allocation (mem).
+     *
+     * Packing strategy (each packed field eliminates one extra cache-line
+     * fetch per trie-node traversal by co-locating values always used
+     * together):
+     *
+     *   node_label[v]  = (uint64_t)label_len[v] << 32 | label_off[v]
+     *     One 8-byte load replaces two 4-byte loads from separate 40 KB
+     *     arrays.  Critical-path: bisect → node_id → this load → memcmp.
+     *
+     *   node_csr[v]    = (uint64_t)(ch_cnt[v] | (is_terminal[v] << 31)) << 32
+     *                    | ch_start[v]
+     *     Folds is_terminal into the count's high bit, eliminating the
+     *     separate is_terminal[] fetch and the `parent < n_nodes` branch.
+     *     The virtual-root entry (index n_nodes) always has bit 31 = 0.
+     *
+     *   child_desc[flat] = (uint64_t)ch_pfx_count[flat] << 32 | ch_node_id[flat]
+     *     One 8-byte load after bisect settles `flat`.  pfx_count was
+     *     previously a separate 40 KB array read at the same index.
+     *
+     *   ch_first_byte[] stays a dense uint8 array — bisect scans it
+     *   sequentially; packing would halve cache-line density and add misses.
+     *
+     * Memory layout (single malloc, all uint64 arrays come first so the
+     * byte arrays need no alignment padding):
+     *   node_label  [n_nodes]         × 8 bytes
+     *   node_csr    [n_nodes + 1]     × 8 bytes   (index n_nodes = virtual root)
+     *   child_desc  [total_children]  × 8 bytes
+     *   ch_first_byte[total_children] × 1 byte
+     *   label_bytes [lb_len]          × 1 byte
+     */
+    const uint64_t *node_label;     /* packed (label_off, label_len)         */
+    const uint64_t *node_csr;       /* packed (ch_start, ch_cnt|is_term_bit) */
+    const uint64_t *child_desc;     /* packed (ch_node_id, ch_pfx_count)     */
+    const uint8_t  *ch_first_byte;  /* dense uint8 for bisect / linear scan  */
+    const uint8_t  *label_bytes;    /* flat UTF-8 label bytes                */
 
-    /* CSR children arrays (n_nodes+1 entries; index n_nodes = virtual root) */
-    const uint32_t *ch_start;       /* start index in child arrays        */
-    const uint32_t *ch_cnt;         /* child count                        */
-
-    /* Flat child arrays (total_children entries, sorted by first_byte/parent) */
-    const uint8_t  *ch_first_byte;  /* first byte of child label          */
-    const uint32_t *ch_node_id;     /* child node id                      */
-    const uint32_t *ch_pfx_count;   /* MPH prefix-sum for this child      */
-
-    void   *mem;                    /* single malloc backing block        */
+    void   *mem;                    /* single malloc backing block           */
 } TrieIndexObject;
 
 /* ------------------------------------------------------------------ */
@@ -136,49 +158,78 @@ TrieIndex_init(TrieIndexObject *self, PyObject *args, PyObject *kwds)
 
     uint32_t total_children = (uint32_t)(cni_buf.len / 4);
 
-    /* Compute total size needed and allocate one block */
-    Py_ssize_t total_size = (Py_ssize_t)(
-        lb_buf.len   +              /* label_bytes   */
-        lo_buf.len   +              /* label_off     */
-        ll_buf.len   +              /* label_len     */
-        it_buf.len   +              /* is_terminal   */
-        cs_buf.len   +              /* ch_start      */
-        cc_buf.len   +              /* ch_cnt        */
-        cfb_buf.len  +              /* ch_first_byte */
-        cni_buf.len  +              /* ch_node_id    */
-        cpc_buf.len                 /* ch_pfx_count  */
-    );
+    /*
+     * Allocate one block with uint64 arrays first (naturally aligned at the
+     * malloc base), then the byte arrays at the end.
+     *
+     *   node_label  [n_nodes]        × 8
+     *   node_csr    [n_nodes + 1]    × 8
+     *   child_desc  [total_children] × 8
+     *   ch_first_byte[total_children]× 1
+     *   label_bytes [lb_buf.len]     × 1
+     */
+    size_t nl_bytes  = (size_t)n_nodes * 8;
+    size_t csr_bytes = (size_t)(n_nodes + 1) * 8;
+    size_t cd_bytes  = (size_t)total_children * 8;
+    size_t total_size = nl_bytes + csr_bytes + cd_bytes
+                        + (size_t)total_children + (size_t)lb_buf.len;
 
-    void *mem = malloc((size_t)total_size > 0 ? (size_t)total_size : 1);
+    void *mem = malloc(total_size > 0 ? total_size : 1);
     if (!mem) {
         PyErr_NoMemory();
         goto release_all;
     }
 
-    /* Copy each array into the block and set the pointer */
     uint8_t *p = (uint8_t *)mem;
 
-#define COPY_BUF(dst_ptr, src_pbuf, ctype) \
-    memcpy(p, (src_pbuf).buf, (size_t)(src_pbuf).len); \
-    (dst_ptr) = (const ctype *)p;                       \
-    p += (src_pbuf).len;
+    /* --- node_label[v] = label_off[v] | (uint64_t)label_len[v] << 32 --- */
+    const uint32_t *lo_ptr = (const uint32_t *)lo_buf.buf;
+    const uint32_t *ll_ptr = (const uint32_t *)ll_buf.buf;
+    uint64_t *nl = (uint64_t *)p;
+    for (size_t v = 0; v < (size_t)n_nodes; v++)
+        nl[v] = (uint64_t)ll_ptr[v] << 32 | (uint64_t)lo_ptr[v];
+    p += nl_bytes;
 
-    COPY_BUF(self->label_bytes,   lb_buf,  uint8_t)
-    COPY_BUF(self->label_off,     lo_buf,  uint32_t)
-    COPY_BUF(self->label_len,     ll_buf,  uint32_t)
-    COPY_BUF(self->is_terminal,   it_buf,  uint8_t)
-    COPY_BUF(self->ch_start,      cs_buf,  uint32_t)
-    COPY_BUF(self->ch_cnt,        cc_buf,  uint32_t)
-    COPY_BUF(self->ch_first_byte, cfb_buf, uint8_t)
-    COPY_BUF(self->ch_node_id,    cni_buf, uint32_t)
-    COPY_BUF(self->ch_pfx_count,  cpc_buf, uint32_t)
+    /* --- node_csr[v] = ch_start[v] | (uint64_t)(ch_cnt[v] | (is_terminal[v]<<31)) << 32
+     *   virtual root (index n_nodes): is_terminal bit = 0 always.       --- */
+    const uint32_t *cs_ptr  = (const uint32_t *)cs_buf.buf;
+    const uint32_t *cc_ptr  = (const uint32_t *)cc_buf.buf;
+    const uint8_t  *it_ptr  = (const uint8_t  *)it_buf.buf;
+    uint64_t *nc = (uint64_t *)p;
+    for (size_t v = 0; v < (size_t)n_nodes; v++) {
+        uint32_t cnt_t = cc_ptr[v] | ((uint32_t)it_ptr[v] << 31);
+        nc[v] = (uint64_t)cnt_t << 32 | (uint64_t)cs_ptr[v];
+    }
+    /* Virtual root: terminal bit = 0 */
+    nc[n_nodes] = (uint64_t)cc_ptr[n_nodes] << 32 | (uint64_t)cs_ptr[n_nodes];
+    p += csr_bytes;
 
-#undef COPY_BUF
+    /* --- child_desc[flat] = ch_node_id[flat] | (uint64_t)ch_pfx_count[flat] << 32 --- */
+    const uint32_t *cni_ptr = (const uint32_t *)cni_buf.buf;
+    const uint32_t *cpc_ptr = (const uint32_t *)cpc_buf.buf;
+    uint64_t *cd = (uint64_t *)p;
+    for (size_t f = 0; f < (size_t)total_children; f++)
+        cd[f] = (uint64_t)cpc_ptr[f] << 32 | (uint64_t)cni_ptr[f];
+    p += cd_bytes;
 
-    free(self->mem);  /* in case re-init is called */
-    self->mem              = mem;
-    self->n_nodes          = n_nodes;
-    self->total_n          = total_n;
+    /* --- ch_first_byte: verbatim copy --- */
+    memcpy(p, cfb_buf.buf, (size_t)total_children);
+    const uint8_t *cfb = p;
+    p += total_children;
+
+    /* --- label_bytes: verbatim copy --- */
+    memcpy(p, lb_buf.buf, (size_t)lb_buf.len);
+    const uint8_t *lbp = p;
+
+    free(self->mem);
+    self->mem            = mem;
+    self->node_label     = nl;
+    self->node_csr       = nc;
+    self->child_desc     = cd;
+    self->ch_first_byte  = cfb;
+    self->label_bytes    = lbp;
+    self->n_nodes        = n_nodes;
+    self->total_n        = total_n;
     self->root_is_terminal = (int)root_is_terminal;
     self->total_children   = total_children;
 
@@ -232,63 +283,90 @@ TrieIndex_lookup(TrieIndexObject *self, PyObject *arg)
     const char   *rem     = word;
     Py_ssize_t    rem_len = word_len;
 
-    const uint8_t  *label_bytes   = self->label_bytes;
-    const uint32_t *label_off     = self->label_off;
-    const uint32_t *label_len     = self->label_len;
-    const uint8_t  *is_terminal   = self->is_terminal;
-    const uint32_t *ch_start      = self->ch_start;
-    const uint32_t *ch_cnt        = self->ch_cnt;
+    const uint64_t *node_label    = self->node_label;
+    const uint64_t *node_csr      = self->node_csr;
+    const uint64_t *child_desc    = self->child_desc;
     const uint8_t  *ch_first_byte = self->ch_first_byte;
-    const uint32_t *ch_node_id    = self->ch_node_id;
-    const uint32_t *ch_pfx_count  = self->ch_pfx_count;
-    uint32_t        n_nodes       = self->n_nodes;
+    const uint8_t  *label_bytes   = self->label_bytes;
 
     while (rem_len > 0) {
-        uint8_t  first_byte = (uint8_t)rem[0];
-        uint32_t start      = ch_start[parent];
-        uint32_t count      = ch_cnt[parent];
+        uint8_t first_byte = (uint8_t)rem[0];
+
+        /* Single 8-byte load: ch_start (low32) + (ch_cnt | is_terminal_bit) (high32) */
+        uint64_t csr   = node_csr[parent];
+        uint32_t start = (uint32_t)csr;
+        uint32_t cnt_t = (uint32_t)(csr >> 32);  /* ch_cnt | (is_terminal << 31) */
+        uint32_t count = cnt_t & 0x7FFFFFFFu;
 
         if (count == 0) {
             PyErr_SetObject(PyExc_KeyError, arg);
             return NULL;
         }
 
-        /* Binary search for first_byte within [start, start+count) */
-        uint32_t lo = 0, hi = count;
-        while (lo < hi) {
-            uint32_t mid = (lo + hi) >> 1;
-            if (ch_first_byte[start + mid] < first_byte)
-                lo = mid + 1;
-            else
-                hi = mid;
+        /* Find the child whose label starts with first_byte.
+         * Item 5: linear scan for small counts (L0=9, L1=4 nodes are
+         * permanently L1-cached; linear scan avoids bisect branch
+         * mispredictions).  Binary search for large counts (L2=10000). */
+        uint32_t lo;
+#define TRIE_LINEAR_THRESHOLD 16u
+        if (count <= TRIE_LINEAR_THRESHOLD) {
+            const uint8_t *fb = ch_first_byte + start;
+            lo = 0;
+            while (lo < count && fb[lo] != first_byte) lo++;
+            if (lo >= count) {
+                PyErr_SetObject(PyExc_KeyError, arg);
+                return NULL;
+            }
+        } else {
+            uint32_t blo = 0, bhi = count;
+            while (blo < bhi) {
+                uint32_t mid = (blo + bhi) >> 1;
+                if (ch_first_byte[start + mid] < first_byte)
+                    blo = mid + 1;
+                else
+                    bhi = mid;
+            }
+            if (blo >= count || ch_first_byte[start + blo] != first_byte) {
+                PyErr_SetObject(PyExc_KeyError, arg);
+                return NULL;
+            }
+            lo = blo;
         }
-        if (lo >= count || ch_first_byte[start + lo] != first_byte) {
-            PyErr_SetObject(PyExc_KeyError, arg);
-            return NULL;
-        }
+#undef TRIE_LINEAR_THRESHOLD
 
-        uint32_t flat  = start + lo;
-        uint32_t child = ch_node_id[flat];
-        uint32_t llen  = label_len[child];
+        uint32_t flat = start + lo;
+
+        /* Single 8-byte load: ch_node_id (low32) + ch_pfx_count (high32) */
+        uint64_t desc    = child_desc[flat];
+        uint32_t child   = (uint32_t)desc;
+        uint32_t pfx_cnt = (uint32_t)(desc >> 32);
+
+        /* Single 8-byte load: label_off (low32) + label_len (high32) */
+        uint64_t nlbl = node_label[child];
+        uint32_t loff = (uint32_t)nlbl;
+        uint32_t llen = (uint32_t)(nlbl >> 32);
 
         /* Verify full label matches */
         if ((Py_ssize_t)llen > rem_len ||
-            memcmp(rem, label_bytes + label_off[child], (size_t)llen) != 0) {
+            memcmp(rem, label_bytes + loff, (size_t)llen) != 0) {
             PyErr_SetObject(PyExc_KeyError, arg);
             return NULL;
         }
 
-        /* Accumulate MPH index */
-        idx += ch_pfx_count[flat];
-        if (parent < n_nodes && is_terminal[parent])
-            idx += 1;
+        /* Accumulate MPH index.
+         * is_terminal[parent] is the high bit of cnt_t — no separate array
+         * load, and no `parent < n_nodes` branch (virtual-root entry always
+         * has bit 31 = 0). */
+        idx += pfx_cnt;
+        idx += cnt_t >> 31;
 
         rem     += llen;
         rem_len -= (Py_ssize_t)llen;
         parent   = child;
     }
 
-    if (!is_terminal[parent]) {
+    /* Check terminal on final node (high bit of node_csr high32). */
+    if (!((uint32_t)(node_csr[parent] >> 32) >> 31)) {
         PyErr_SetObject(PyExc_KeyError, arg);
         return NULL;
     }
