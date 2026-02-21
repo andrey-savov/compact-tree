@@ -8,7 +8,7 @@ version = "2.1.0"
 description = "Compact, read-only nested dictionary backed by a DAWG-style radix trie"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+license = {text = "MIT"}
 authors = [
     {name = "Andrey Savov", email = "savov@hotmail.com"}
 ]
