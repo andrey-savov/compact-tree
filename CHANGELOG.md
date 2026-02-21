@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-02-20
+
+### Fixed
+
+- `MarisaTrie.to_dict()`: replaced Python 3.10+ union type annotation (`dict[str, int] | None`) with `Optional[dict[str, int]]` for Python 3.9 compatibility ([#4](https://github.com/andrey-savov/compact-tree/pull/4)).
+
 ## [1.2.0] - 2026-02-20
 
 ### Added
