@@ -17,6 +17,7 @@ Usage
   python profile_synthetic.py --mode deserialize # profile single deserialize
   python profile_synthetic.py --mode serde      # profile serialize then deserialize
   python profile_synthetic.py --l2 5000 --mode serde  # override L2 key count
+  python profile_synthetic.py --mode lookup --vocab-size 0  # disable LRU, profile _index_uncached
 """
 
 import argparse
@@ -28,6 +29,7 @@ import pstats
 import random
 import tempfile
 import time
+from typing import Optional
 from pathlib import Path
 
 from compact_tree import CompactTree
@@ -126,7 +128,7 @@ def build_dict(l2_keys: int = 173_000) -> dict:
 # Profiling
 # ---------------------------------------------------------------------------
 
-def profile_ingestion(d: dict) -> CompactTree:
+def profile_ingestion(d: dict, vocabulary_size: Optional[int] = None) -> CompactTree:
     """Profile CompactTree.from_dict(d) and print a summary."""
     # Estimate unique keys and values to size the LRU cache exactly.
     all_keys: set[str] = set()
@@ -139,16 +141,22 @@ def profile_ingestion(d: dict) -> CompactTree:
             else:
                 all_values.add(str(v))
     _walk(d)
-    vocab_size = len(all_keys) + len(all_values)
+    vocab_hint = (
+        f"vocabulary_size={vocabulary_size} (cache DISABLED — every lookup calls _index_uncached)"
+        if vocabulary_size == 0
+        else f"vocabulary_size={vocabulary_size!r} (auto-sized to vocab)"
+        if vocabulary_size is not None
+        else f"vocabulary_size=None (auto={len(all_keys) + len(all_values):,})"
+    )
     print(f"  Unique keys: {len(all_keys):,}, unique values: {len(all_values):,} "
-          f"-> vocabulary_size=None (unbounded)")
+          f"-> {vocab_hint}")
 
     profiler = cProfile.Profile()
 
     print("\nProfiling CompactTree.from_dict() ...")
     wall_start = time.perf_counter()
     profiler.enable()
-    tree = CompactTree.from_dict(d)
+    tree = CompactTree.from_dict(d, vocabulary_size=vocabulary_size)
     profiler.disable()
     wall_elapsed = time.perf_counter() - wall_start
     print(f"  Wall time: {wall_elapsed:.3f}s")
@@ -230,10 +238,14 @@ def profile_lookup(tree: CompactTree, d: dict,
     n0, n1, n2 = len(l0_keys), len(l1_keys), len(l2_keys)
     print(f"\nKey lists: L0={n0}, L1={n1}, L2={n2:,}")
 
-    # Warmup: prime lru_cache on all three key levels.
-    for _ in range(2_000):
-        _ = tree[l0_keys[_ % n0]]
-    print("  Warmed up")
+    # Warmup: prime lru_cache on all three key levels (skip if cache disabled).
+    cache_disabled = getattr(tree, '_key_vocab_size', None) == 0
+    if cache_disabled:
+        print("  Cache disabled (vocab_size=0) — skipping warmup, profiling _index_uncached directly")
+    else:
+        for _ in range(2_000):
+            _ = tree[l0_keys[_ % n0]]
+        print("  Warmed up")
 
     rng = random.Random(42)
     profiler = cProfile.Profile()
@@ -370,6 +382,15 @@ if __name__ == "__main__":
         metavar="N",
         help="Number of L2 keys (default: 10000 for serde modes, 173000 otherwise)",
     )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="vocab_size",
+        help="vocabulary_size passed to from_dict (sets lru_cache maxsize). "
+             "Use 0 to disable the LRU cache entirely and profile _index_uncached directly.",
+    )
     args = parser.parse_args()
 
     # Resolve L2 size: explicit > mode default > global default
@@ -383,12 +404,12 @@ if __name__ == "__main__":
     d = build_dict(l2_keys=l2_size)
 
     if args.mode in ("build", "both"):
-        tree = profile_ingestion(d)
+        tree = profile_ingestion(d, vocabulary_size=args.vocab_size)
     else:
         # Build silently for all other modes.
         print("\nBuilding CompactTree (unprofiled)...")
         t0 = time.perf_counter()
-        tree = CompactTree.from_dict(d)
+        tree = CompactTree.from_dict(d, vocabulary_size=args.vocab_size)
         print(f"  Built in {time.perf_counter() - t0:.3f}s")
 
     if args.mode in ("lookup", "both"):

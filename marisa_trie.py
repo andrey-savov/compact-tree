@@ -60,9 +60,12 @@ class MarisaTrie:
             self._root_is_terminal: bool            = False
             self._root_children:    list[int]       = []
             self._node_labels:      list[str]       = []
+            self._node_label_lens:  list[int]       = []
             self._node_terminal:    list[bool]      = []
             self._node_children:    list[list[int]] = []
             self._node_counts:      list[int]       = []
+            self._first_char_maps:  list[dict]      = [{}]
+            self._prefix_counts:    list[list[int]] = [[0]]
             self._attach_index_cache(cache_size)
             return
 
@@ -150,10 +153,46 @@ class MarisaTrie:
         self._node_terminal = node_terminal
         self._node_children = node_children
         self._node_counts   = self._compute_counts(children_map)
+        self._node_label_lens = [len(lb) for lb in node_labels]
+        self._build_navigation_tables()
 
         # Build {word: idx} cheaply from the just-populated structures;
         # consumed and freed on the first to_dict() call.
         self._word_to_idx: dict[str, int] = self._build_word_index(children_map)
+
+    def _build_navigation_tables(self) -> None:
+        """Build O(1) child-dispatch and prefix-count structures.
+
+        ``_first_char_maps[node+1]``  maps the first character of each child's
+        label to ``(position_in_children_list, child_node_id)``.
+
+        ``_prefix_counts[node+1][i]`` is the cumulative subtree-word count of
+        all siblings *before* position ``i``, enabling O(1) MPH index
+        accumulation without an inner loop.
+
+        Index 0 is the virtual root (``node == -1``); index ``i+1`` is node ``i``.
+        """
+        _labels  = self._node_labels
+        _counts  = self._node_counts
+        _children = self._node_children
+
+        all_children: list[list[int]] = [self._root_children] + _children
+        first_char_maps: list[dict[str, tuple[int, int]]] = []
+        prefix_counts:   list[list[int]] = []
+
+        for children in all_children:
+            fc_map: dict[str, tuple[int, int]] = {}
+            pc: list[int] = [0]
+            running = 0
+            for i, child in enumerate(children):
+                fc_map[_labels[child][0]] = (i, child)
+                running += _counts[child]
+                pc.append(running)
+            first_char_maps.append(fc_map)
+            prefix_counts.append(pc)
+
+        self._first_char_maps = first_char_maps
+        self._prefix_counts   = prefix_counts
 
     def _compute_counts(self, children_map: dict[int, list[int]]) -> list[int]:
         """Compute subtree word counts bottom-up."""
@@ -223,8 +262,8 @@ class MarisaTrie:
     def _index_uncached(self, word: str) -> int:
         """Return the dense unique index for *word* in ``[0, N)``.
 
-        Navigates the in-memory radix trie using plain list indexing -
-        no rank/select operations.
+        Navigates the in-memory radix trie using O(1) first-char dispatch
+        and precomputed prefix counts — no linear scan, no rank/select.
 
         Raises:
             KeyError: If *word* is not in the trie.
@@ -240,31 +279,29 @@ class MarisaTrie:
         idx       = 1 if self._root_is_terminal else 0
         remaining = word
         node      = -1          # -1 = virtual root
-        children  = self._root_children
 
-        _labels   = self._node_labels
-        _counts   = self._node_counts
-        _terminal = self._node_terminal
-        _children = self._node_children
+        _labels        = self._node_labels
+        _label_lens    = self._node_label_lens
+        _counts        = self._node_counts
+        _terminal      = self._node_terminal
+        _first_char_maps = self._first_char_maps
+        _prefix_counts   = self._prefix_counts
 
         while remaining:
-            matched = False
-            for i, child in enumerate(children):
-                label = _labels[child]
-                if remaining.startswith(label):
-                    # Accumulate subtree counts of preceding siblings
-                    for j in range(i):
-                        idx += _counts[children[j]]
-                    # If the node we are descending *from* is terminal, count it
-                    if node >= 0 and _terminal[node]:
-                        idx += 1
-                    remaining = remaining[len(label):]
-                    node      = child
-                    children  = _children[child]
-                    matched   = True
-                    break
-            if not matched:
+            entry = _first_char_maps[node + 1].get(remaining[0])
+            if entry is None:
                 raise KeyError(word)
+            i, child = entry
+            label_len = _label_lens[child]
+            if remaining[:label_len] != _labels[child]:
+                raise KeyError(word)
+            # Accumulate subtree counts of preceding siblings (O(1) lookup)
+            idx += _prefix_counts[node + 1][i]
+            # If the node we are descending *from* is terminal, count it
+            if node >= 0 and _terminal[node]:
+                idx += 1
+            remaining = remaining[label_len:]
+            node      = child
 
         if not _terminal[node]:
             raise KeyError(word)
@@ -558,10 +595,12 @@ class MarisaTrie:
         trie._root_is_terminal = root_is_terminal
         trie._root_children    = root_children
         trie._node_labels      = node_labels
+        trie._node_label_lens  = [len(lb) for lb in node_labels]
         trie._node_terminal    = node_terminal
         trie._node_children    = node_children
         trie._node_counts      = node_counts
         trie._cache_size       = cache_size
+        trie._build_navigation_tables()
         trie._attach_index_cache(cache_size)
         return trie
 
