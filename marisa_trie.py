@@ -30,11 +30,17 @@ class MarisaTrie:
     #  Construction                                                        #
     # ------------------------------------------------------------------ #
 
-    def __init__(self, words: Iterable[str]) -> None:
+    def __init__(self, words: Iterable[str], *, cache_size: Optional[int] = None) -> None:
         """Build a MarisaTrie from an iterable of strings.
         
         Args:
             words: Iterable of strings. Duplicates are silently removed.
+            cache_size: Maximum number of entries in the per-instance
+                ``lru_cache`` used by ``index()``.  ``None`` (default) means
+                unbounded: the cache grows only as words are looked up and
+                never evicts entries.  Pass an explicit integer to cap memory
+                usage at the cost of possible evictions when more than
+                ``cache_size`` distinct words are looked up.
         """
         # Deduplicate and collect unique words
         unique = list(dict.fromkeys(words))
@@ -50,7 +56,7 @@ class MarisaTrie:
             self._tail_trie: Optional[MarisaTrie] = None
             self._root_is_terminal = False
             # Install C-level LRU cache as instance attribute (shadows class method)
-            self.index = lru_cache(maxsize=4096)(self._index_uncached)
+            self.index = lru_cache(maxsize=cache_size)(self._index_uncached)
             return
         
         # Build intermediate trie structure
@@ -63,7 +69,7 @@ class MarisaTrie:
         self._build_louds(root)
 
         # Install C-level LRU cache as instance attribute (shadows class method)
-        self.index = lru_cache(maxsize=4096)(self._index_uncached)
+        self.index = lru_cache(maxsize=cache_size)(self._index_uncached)
 
     def _build_intermediate_trie(self, words: list[str]) -> dict:
         """Build an intermediate dict-of-dicts trie from unique words.
@@ -559,11 +565,14 @@ class MarisaTrie:
         return buf.getvalue()
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "MarisaTrie":
+    def from_bytes(cls, data: bytes, *, cache_size: Optional[int] = None) -> "MarisaTrie":
         """Deserialize a trie from bytes.
         
         Args:
             data: Binary representation from to_bytes().
+            cache_size: Maximum number of entries in the per-instance
+                ``lru_cache`` used by ``index()``.  See ``__init__`` for
+                details.  Defaults to ``None`` (unbounded).
             
         Returns:
             Reconstructed MarisaTrie.
@@ -616,7 +625,7 @@ class MarisaTrie:
             offset += 4 + length
         
         # Install C-level LRU cache as instance attribute (shadows class method)
-        trie.index = lru_cache(maxsize=4096)(trie._index_uncached)
+        trie.index = lru_cache(maxsize=cache_size)(trie._index_uncached)
 
         return trie
 

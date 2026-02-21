@@ -112,15 +112,18 @@ call made by `CompactTree.from_dict()`, keeping steady-state memory minimal.
 ### from_dict build pipeline
 
 ```
-from_dict(data)
+from_dict(data, *, vocabulary_size=None)
   |
   +-- _walk_dict()              collect all_keys (set) + all_values (list)
   |
-  +-- MarisaTrie(all_keys)      build key trie
+  +-- key_cache_size  =  vocabulary_size  or  len(all_keys)
+  +-- val_cache_size  =  vocabulary_size  or  len(unique_values)
+  |
+  +-- MarisaTrie(all_keys, cache_size=key_cache_size)      build key trie
   |     _build_intermediate_trie() -> dict-of-dicts
   |     _build_louds()          -> LOUDS + _counts + _word_to_idx (via DFS over nodes_metadata)
   |
-  +-- MarisaTrie(unique_values) build value trie  (same pipeline)
+  +-- MarisaTrie(unique_values, cache_size=val_cache_size) build value trie  (same pipeline)
   |
   +-- key_trie.to_dict()        O(N) pop of _word_to_idx  ->  key_id: dict[str,int]
   +-- val_trie.to_dict()        O(M) pop of _word_to_idx  ->  val_id: dict[str,int]
@@ -134,14 +137,21 @@ Critically, LOUDS rank/select is used only **3 times** during `from_dict`:
 once per `Poppy.__init__` call (one key trie, one value trie, one CompactTree
 LOUDS). All vocabulary lookups during BFS encoding are O(1) plain-dict hits.
 
-## Binary format (v3)
+## Binary format (v4)
 
 ```
 Magic   : 5 bytes   "CTree"
-Version : 8 bytes   uint64 LE (always 3)
-Header  : 5 x 8 bytes  lengths of: keys, values, louds, vcol, elbl
+Version : 8 bytes   uint64 LE (always 4; v3 files are still readable)
+Header  : 7 x 8 bytes  lengths of: keys, values, louds, vcol, elbl,
+                         key_vocab_size, val_vocab_size
 Payload : keys_bytes | val_bytes | louds_bytes | vcol_bytes | elbl_bytes
 ```
+
+`key_vocab_size` and `val_vocab_size` are the effective `lru_cache(maxsize=…)` values
+used for the key and value `MarisaTrie` instances respectively.  They are set during
+`from_dict` (either from the caller-supplied `vocabulary_size` hint or computed
+automatically as `len(all_keys)` / `len(unique_values)`) and restored on every load
+so that query-time caches are immediately correctly sized.
 
 `keys_bytes` and `val_bytes` are serialised `MarisaTrie` instances (see
 `MarisaTrie.to_bytes()`). `louds_bytes` is the raw bitarray, `vcol_bytes` and
