@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-02-21
+
+### Added
+
+- Optional C extension `_marisa_ext` (`_marisa_ext.c`) providing two classes:
+  - `TrieIndex` — C-level radix trie lookup, ~5-10x faster than the pure-Python path for uncached queries.
+  - `TreeIndex` — C-level `CompactTree` traversal that executes `__getitem__`, `__contains__`, and multi-level `get_path()` entirely in C.
+- `CompactTree.get_path(*keys)` — look up a value by traversing multiple levels in a single call. Equivalent to `tree[k0][k1]...[kN]` but descends all levels inside a single C call (when the extension is available), avoiding per-level Python overhead and intermediate `_Node` allocations.
+- `CompactTree._attach_c_tree()` — internal helper that wires up the `TreeIndex` after construction, deserialization, and unpickling.
+- Navigation tables in `MarisaTrie`:
+  - `_node_label_lens` — pre-computed label lengths for O(1) byte-length access.
+  - `_first_char_maps` — per-node first-character dispatch tables for O(1) child selection.
+  - `_prefix_counts` — per-node cumulative subtree-word counts for O(1) MPH index accumulation.
+- `MarisaTrie._build_navigation_tables()` — constructs all three navigation tables after the CSR arrays are finalized.
+- `MarisaTrie._build_c_index()` — packs trie arrays into flat byte buffers and creates a `TrieIndex`; sets `self._c_index`. No-ops silently if the extension is not compiled.
+- `generate_compile_commands.py` — helper script that generates `compile_commands.json` for IDE/clangd integration when developing the C extension.
+- `_marisa_ext.pyi` — type stubs for the C extension (`TrieIndex` and `TreeIndex`).
+- `setup.py` — build configuration for the optional `_marisa_ext` C extension (`optional=True`; installation succeeds without a C compiler).
+
+### Changed
+
+- `CompactTree.__getitem__` and `CompactTree.__contains__` (at root level and on `_Node`) delegate to `TreeIndex.get()` / `TreeIndex.find()` when the C extension is available, bypassing Python trie traversal entirely.
+- `MarisaTrie.__init__` now additionally builds `_node_label_lens`, `_first_char_maps`, and `_prefix_counts` via `_build_navigation_tables()`, and calls `_build_c_index()` to create the optional `TrieIndex`.
+- `MANIFEST.in` updated to include `_marisa_ext.c`, `_marisa_ext.pyi`, and `generate_compile_commands.py`.
+- `.gitignore` updated to exclude compiled C extension artefacts.
+
+### Performance
+
+Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries.
+
+| Metric | v2.0.0 | v2.1.0 (C ext) | Improvement |
+|---|---|---|---|
+| Lookup throughput | 67,889/s (14.7 µs) | ~340,000–680,000/s (1.5–3 µs) | **5–10×** |
+| `get_path()` (3 levels) | 3 × `__getitem__` | single C call | eliminates intermediate `_Node` allocs |
+
+*`from_dict`, serialize, and deserialize performance unchanged from v2.0.0.*
+
 ## [2.0.0] - 2026-02-20
 
 ### Breaking Changes
@@ -151,7 +188,8 @@ Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entr
 - succinct >= 0.0.7
 - fsspec >= 2021.0.0
 
-[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/andrey-savov/compact-tree/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/andrey-savov/compact-tree/compare/v1.2.1...v2.0.0
 [1.2.1]: https://github.com/andrey-savov/compact-tree/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/andrey-savov/compact-tree/compare/v1.1.0...v1.2.0

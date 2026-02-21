@@ -11,6 +11,8 @@ Compact, read-only nested dictionary backed by a DAWG-style radix trie.
 
 - **Memory-efficient**: DAWG-style deduplication via two `MarisaTrie` instances (one for keys, one for values)
 - **Fast lookups**: Plain list-indexing over parallel arrays — no rank/select overhead
+- **C-accelerated lookups**: Optional `_marisa_ext` C extension provides `TrieIndex` and `TreeIndex` for ~5–10× faster uncached queries
+- **Multi-level traversal**: `get_path(*keys)` descends multiple levels in a single C call, eliminating intermediate `_Node` allocations
 - **High-performance builds**: 7.3s for a 6.2M-leaf, 173K-key tree (v2.0.0)
 - **Fast serialization**: 14/s at 173K keys, 77 MiB files
 - **Serializable**: Save and load from disk with efficient binary format
@@ -76,6 +78,9 @@ tree2 = pickle.loads(data)
 
 # Convert back to plain dict
 plain_dict = loaded_tree.to_dict()
+
+# Multi-level lookup in a single C call (when C extension is compiled)
+result = tree.get_path("a", "x")   # equivalent to tree["a"]["x"] but faster
 ```
 
 ## How It Works
@@ -110,7 +115,12 @@ CompactTree
   +-- vcol         : array.array('I')  value column (uint32: value id or 0xFFFFFFFF for internal nodes)
   +-- _key_trie    : MarisaTrie        key vocabulary (word <-> dense index)
   +-- _val_trie    : MarisaTrie        value vocabulary (word <-> dense index)
+  +-- _c_tree      : TreeIndex | None  optional C-level traversal helper (None if extension not built)
 ```
+
+`MarisaTrie` additionally exposes:
+- `_c_index` (`TrieIndex`) — C-level lookup helper, set by `_build_c_index()` when the extension is available.
+- `_first_char_maps` / `_prefix_counts` / `_node_label_lens` — navigation tables built by `_build_navigation_tables()` for O(1) child dispatch and MPH index accumulation.
 
 Each non-root node `v` (0-indexed) occupies a slot in both `elbl` (its edge label / key id) and `vcol` (its value id, or the sentinel `0xFFFFFFFF` for internal nodes).
 
@@ -156,12 +166,14 @@ See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for detailed results and [OPTIM
 
 Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries.
 
-| Metric | v2.0.0 |
-|---|---|
-| `from_dict` build time | 7.3s |
-| Lookup throughput | 67,889/s (14.7 µs/lookup) |
-| Serialize | 14.0/s (71.6 ms), 77.2 MiB |
-| Deserialize | 1.0/s (999 ms) |
+| Metric | v2.0.0 | v2.1.0 (C ext) |
+|---|---|---|
+| `from_dict` build time | 7.3s | 7.3s |
+| Lookup throughput | 67,889/s (14.7 µs) | ~340,000–680,000/s (1.5–3 µs) |
+| Serialize | 14.0/s (71.6 ms), 77.2 MiB | 14.0/s (71.6 ms), 77.2 MiB |
+| Deserialize | 1.0/s (999 ms) | 1.0/s (999 ms) |
+
+*Lookup improvement requires `_marisa_ext` C extension (built automatically when a C compiler is available). Pure-Python fallback matches v2.0.0.*
 
 ## Contributing
 
