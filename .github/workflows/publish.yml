@@ -39,6 +39,7 @@ jobs:
     - name: Build wheels
       uses: pypa/cibuildwheel@v2.21.3
       env:
+        CIBW_BUILD_FRONTEND: "build[uv]"
         CIBW_ARCHS_MACOS: ${{ matrix.cibw-archs }}
         CIBW_SKIP: ${{ matrix.cibw-skip }}
 
@@ -55,18 +56,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
 
     - name: Install build dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install build twine
+      run: uv pip install --system build twine
 
     - name: Build sdist
-      run: python -m build --sdist
+      run: uv run python -m build --sdist
 
     - name: Check sdist
       run: twine check dist/*
@@ -96,9 +93,12 @@ jobs:
         path: dist/
         merge-multiple: true
 
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+
     - name: Check distributions
       run: |
-        pip install twine
+        uv pip install --system twine
         twine check dist/*
 
     - name: Publish to PyPI
@@ -125,9 +125,12 @@ jobs:
         path: dist/
         merge-multiple: true
 
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+
     - name: Check distributions
       run: |
-        pip install twine
+        uv pip install --system twine
         twine check dist/*
 
     - name: Publish to Test PyPI
