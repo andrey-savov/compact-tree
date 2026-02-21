@@ -85,22 +85,48 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CompactTree":
+    def from_dict(cls, data: dict[str, Any], *,
+                  vocabulary_size: Optional[int] = None) -> "CompactTree":
         """Build a *CompactTree* entirely in memory from a nested Python dict.
 
         Keys must be strings.  Leaf values are stored as strings (non-string
         values are converted via ``str()``).
+
+        Args:
+            vocabulary_size: Optional hint for the total number of unique words
+                in the source dict (keys + values combined).  Used to size the
+                LRU cache on each ``MarisaTrie`` so that all vocabulary entries
+                fit in cache with zero evictions.  When ``None`` (default) the
+                actual vocabulary sizes are computed automatically from the data
+                and used as the cache size for each trie independently.
         """
         # 1. Collect vocabulary and leaf values
         all_keys: set[str] = set()
         all_values: list[str] = []
         cls._walk_dict(data, all_keys, all_values)
 
+        # Determine per-trie cache sizes: honour the caller's hint (applied to
+        # both tries) or fall back to the exact vocabulary size for each trie.
+        unique_values: set[str] = set(str(v) for v in all_values)
+        if vocabulary_size is not None:
+            key_cache_size: int = vocabulary_size
+            val_cache_size: int = vocabulary_size
+        else:
+            key_cache_size = len(all_keys)
+            val_cache_size = len(unique_values)
+
         # 2. Build MarisaTrie for keys (deduplicated)
-        key_trie = MarisaTrie(all_keys)
+        key_trie = MarisaTrie(all_keys, cache_size=key_cache_size)
 
         # 3. Build MarisaTrie for values (deduplicated)
-        val_trie = MarisaTrie(all_values)
+        val_trie = MarisaTrie(unique_values, cache_size=val_cache_size)
+
+        # Build plain {word: idx} dicts via a single DFS over each trie.
+        # This replaces the old pre-warm loop: instead of N individual trie
+        # traversals (one per unique word), we do exactly one O(N) DFS pass
+        # per trie, eliminating all rank/select overhead for the warm-up phase.
+        key_id: dict[str, int] = key_trie.to_dict()
+        val_id: dict[str, int] = val_trie.to_dict()
 
         # 4. BFS -> LOUDS bits + vcol + elbl
         louds_bits = bitarray()
@@ -108,18 +134,29 @@ class CompactTree:
         elbl_buf = bytearray()
         queue: deque[Optional[dict]] = deque()
 
+        # Cache (sorted_keys, key_indices) by frozenset of key names so that
+        # sibling dicts with the same key set pay the MarisaTrie lookup cost
+        # only once regardless of how many times that key set appears.
+        _key_order_cache: dict[frozenset, tuple[list[str], dict[str, int]]] = {}
+
         def _emit_children(node: dict[str, Any]) -> None:
-            # Cache key lookups to avoid repeated MarisaTrie traversals
-            key_indices = {k: key_trie[k] for k in node.keys()}
-            for key in sorted(node.keys(), key=lambda k: key_indices[k]):
+            keyset = frozenset(node.keys())
+            cached = _key_order_cache.get(keyset)
+            if cached is None:
+                indices = {k: key_id[k] for k in node.keys()}
+                sorted_keys = sorted(node.keys(), key=lambda k: indices[k])
+                _key_order_cache[keyset] = (sorted_keys, indices)
+            else:
+                sorted_keys, indices = cached
+            for key in sorted_keys:
                 louds_bits.append(True)
-                elbl_buf.extend(struct.pack("<I", key_indices[key]))
+                elbl_buf.extend(struct.pack("<I", indices[key]))
                 child = node[key]
                 if isinstance(child, dict):
                     vcol_buf.extend(struct.pack("<I", _INTERNAL))
                     queue.append(child)
                 else:
-                    vcol_buf.extend(struct.pack("<I", val_trie[str(child)]))
+                    vcol_buf.extend(struct.pack("<I", val_id[str(child)]))
                     queue.append(None)          # leaf placeholder
             louds_bits.append(False)
 
@@ -138,6 +175,8 @@ class CompactTree:
         tree.mm = None
         tree._key_trie = key_trie
         tree._val_trie = val_trie
+        tree._key_vocab_size = key_cache_size
+        tree._val_vocab_size = val_cache_size
         ba = louds_bits
         tree.louds = LOUDS(Poppy(ba), ba)
         tree.vcol = bytes(vcol_buf)
@@ -167,20 +206,39 @@ class CompactTree:
             with self._wrap_read_stream(raw_stream, compression) as f:
                 # Read header
                 magic, ver = struct.unpack("<5sQ", f.read(13))
-                assert magic == b"CTree" and ver == 3
-
-                # Read section lengths
-                keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
-                    "<QQQQQ", f.read(40),
+                assert magic == b"CTree" and ver in (3, 4), (
+                    f"Unsupported CompactTree format version {ver}"
                 )
+
+                # Read section lengths (v4 adds key_vocab + val_vocab fields)
+                if ver == 4:
+                    (
+                        keys_len, val_len, louds_len, vcol_len, elbl_len,
+                        _key_vocab_size, _val_vocab_size,
+                    ) = struct.unpack("<QQQQQQQ", f.read(56))
+                else:  # v3 — derive cache sizes from the trie data itself
+                    keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
+                        "<QQQQQ", f.read(40),
+                    )
+                    _key_vocab_size = None
+                    _val_vocab_size = None
 
                 # Read and parse keys MarisaTrie
                 keys_bytes = f.read(keys_len)
-                self._key_trie = MarisaTrie.from_bytes(keys_bytes)
+                self._key_trie = MarisaTrie.from_bytes(
+                    keys_bytes,
+                    cache_size=_key_vocab_size or None,
+                )
 
                 # Read values MarisaTrie
                 val_bytes = f.read(val_len)
-                self._val_trie = MarisaTrie.from_bytes(val_bytes)
+                self._val_trie = MarisaTrie.from_bytes(
+                    val_bytes,
+                    cache_size=_val_vocab_size or None,
+                )
+
+                self._key_vocab_size = _key_vocab_size or self._key_trie._n
+                self._val_vocab_size = _val_vocab_size or self._val_trie._n
 
                 # Read and parse LOUDS section
                 ba = bitarray()
@@ -225,11 +283,13 @@ class CompactTree:
         with fs.open(path, "wb") as raw_stream:
             with self._wrap_write_stream(raw_stream, compression) as f:
                 f.write(b"CTree")
-                f.write(struct.pack("<Q", 3))
+                f.write(struct.pack("<Q", 4))
                 f.write(struct.pack(
-                    "<QQQQQ",
+                    "<QQQQQQQ",
                     len(keys_bytes), len(val_bytes), len(louds_bytes),
                     len(vcol_bytes), len(elbl_bytes),
+                    getattr(self, "_key_vocab_size", self._key_trie._n),
+                    getattr(self, "_val_vocab_size", self._val_trie._n),
                 ))
                 f.write(keys_bytes)
                 f.write(val_bytes)
@@ -411,18 +471,20 @@ class CompactTree:
         elbl_bytes = bytes(self.elbl)
         
         buf.write(b"CTree")
-        buf.write(struct.pack("<Q", 3))
+        buf.write(struct.pack("<Q", 4))
         buf.write(struct.pack(
-            "<QQQQQ",
+            "<QQQQQQQ",
             len(keys_bytes), len(val_bytes), len(louds_bytes),
             len(vcol_bytes), len(elbl_bytes),
+            getattr(self, "_key_vocab_size", self._key_trie._n),
+            getattr(self, "_val_vocab_size", self._val_trie._n),
         ))
         buf.write(keys_bytes)
         buf.write(val_bytes)
         buf.write(louds_bytes)
         buf.write(vcol_bytes)
         buf.write(elbl_bytes)
-        
+
         serialized = buf.getvalue()
         return (self._unpickle_from_bytes, (serialized,))
 
@@ -434,21 +496,40 @@ class CompactTree:
         
         # Read header
         magic, ver = struct.unpack("<5sQ", f.read(13))
-        assert magic == b"CTree" and ver == 3
-
-        # Read section lengths
-        keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
-            "<QQQQQ", f.read(40),
+        assert magic == b"CTree" and ver in (3, 4), (
+            f"Unsupported CompactTree format version {ver}"
         )
+
+        # Read section lengths (v4 adds key_vocab + val_vocab fields)
+        if ver == 4:
+            (
+                keys_len, val_len, louds_len, vcol_len, elbl_len,
+                _key_vocab_size, _val_vocab_size,
+            ) = struct.unpack("<QQQQQQQ", f.read(56))
+        else:  # v3 — derive cache sizes from the trie data itself
+            keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
+                "<QQQQQ", f.read(40),
+            )
+            _key_vocab_size = None
+            _val_vocab_size = None
 
         # Read and parse keys MarisaTrie
         tree = CompactTree.__new__(CompactTree)
         keys_bytes = f.read(keys_len)
-        tree._key_trie = MarisaTrie.from_bytes(keys_bytes)
+        tree._key_trie = MarisaTrie.from_bytes(
+            keys_bytes,
+            cache_size=_key_vocab_size or None,
+        )
 
         # Read values MarisaTrie
         val_bytes = f.read(val_len)
-        tree._val_trie = MarisaTrie.from_bytes(val_bytes)
+        tree._val_trie = MarisaTrie.from_bytes(
+            val_bytes,
+            cache_size=_val_vocab_size or None,
+        )
+
+        tree._key_vocab_size = _key_vocab_size or tree._key_trie._n
+        tree._val_vocab_size = _val_vocab_size or tree._val_trie._n
 
         # Read and parse LOUDS section
         ba = bitarray()

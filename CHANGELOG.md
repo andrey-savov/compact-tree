@@ -7,14 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-02-15
+## [1.2.0] - 2026-02-20
 
 ### Added
 
-- LRU cache for `MarisaTrie.index()` lookups with 4,096 entry limit (Optimization #4)
-- Pre-computed label offsets array for O(1) label access in `MarisaTrie` (Optimization #3)
-- Key lookup caching in `CompactTree._emit_children()` to eliminate redundant trie traversals (Optimization #2)
-- Optimized count computation using children_map instead of LOUDS navigation (Optimization #1)
+- `MarisaTrie.to_dict()` — bulk O(N) enumeration returning `{word: index}` for every word. On the first call after construction it returns the index built cheaply from the intermediate trie data (zero LOUDS traversals) and frees it immediately; subsequent calls or calls on deserialized tries fall back to a single DFS over the LOUDS bit vector.
+- `MarisaTrie._build_word_index_from_intermediate()` — private helper that walks the BFS `nodes_metadata` / `children_map` structures (plain Python dicts, no rank/select) to produce a `{word: idx}` mapping during `__init__`.
+- `_word_to_idx` temporary instance attribute on `MarisaTrie` — produced during `_build_louds`, consumed and freed by the first `to_dict()` call, keeping run-time memory minimal.
+- Frozenset-keyed `_key_order_cache` in `CompactTree._emit_children()` — sibling dicts sharing the same key set pay the sorting and index-lookup cost only once regardless of how many times that key set appears across the tree.
+- `vocabulary_size` keyword argument to `CompactTree.from_dict()` — optional hint for the total number of unique words in the source dict. When provided, used as the `lru_cache` size for both the key and value `MarisaTrie` instances so the entire vocabulary fits in cache with zero evictions. When `None` (default), cache sizes are computed automatically (`len(all_keys)` for the key trie, `len(unique_values)` for the value trie).
+- `cache_size` keyword argument to `MarisaTrie.__init__()` and `MarisaTrie.from_bytes()` — controls `lru_cache(maxsize=…)` on each instance; `None` (default) means unbounded.
+- `_key_vocab_size` and `_val_vocab_size` instance attributes on `CompactTree` — the effective cache sizes used for each trie (set during `from_dict`, or read from the file header on deserialization).
+- `profile_synthetic.py` — profiling harness using corpus n-gram permutations (N=1..7, 4.4M unique strings) as a realistic vocabulary for 3-level nested dicts.
 - Comprehensive benchmarking infrastructure with `pytest-benchmark`
 - Load testing with co-occurrence dictionaries from text corpus
 - Profiling scripts: `profile_marisa.py`, `profile_compact_tree.py`
@@ -23,17 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `MarisaTrie.index()` now uses instance-level LRU cache via `OrderedDict`
-- `MarisaTrie._get_label()` complexity reduced from O(n) to O(1)
-- `MarisaTrie._compute_counts()` replaced with `_compute_counts_optimized()` using direct child mapping
+- `CompactTree.from_dict()` now calls `key_trie.to_dict()` and `val_trie.to_dict()` once each (single O(N) DFS per trie) instead of invoking `_index_uncached` per unique word. Eliminates all rank/select overhead during the vocabulary warm-up phase.
+- `MarisaTrie.index()` LRU implementation replaced: `OrderedDict`-based manual LRU removed in favour of a per-instance `functools.lru_cache`-wrapped `_index_uncached`, sized to the trie vocabulary (or caller-supplied `cache_size`). Eliminates `move_to_end` overhead and benefits from CPython's C-level cache implementation.
+- Several micro-optimizations in `MarisaTrie._build_louds()`: inline child iteration (no per-node list allocation), arithmetic label-offset tracking (avoids `len(labels_buf)` calls), single-pass `nodes_metadata` loop for labels + terminal bits, and bulk `struct.pack` in `_compute_counts_optimized`.
+- `MarisaTrie._get_label()` complexity reduced from O(n) to O(1) via pre-computed `_label_offsets` array.
+- `MarisaTrie._compute_counts()` replaced with `_compute_counts_optimized()` using direct `children_map` traversal instead of LOUDS navigation.
+- Binary format bumped from **v3 to v4**. The serialized header now carries two additional `uint64` fields (`key_vocab_size`, `val_vocab_size`) that restore correctly-sized LRU caches on load. Files serialized in v3 format are still read correctly; cache sizes fall back to each trie's vocabulary size.
 
 ### Performance
 
+Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries, vocabulary from corpus n-gram permutations.
+
+| Metric | v1.1.0 | v1.2.0 | Improvement |
+|---|---|---|---|
+| `from_dict` wall time (real) | ~22s | ~10s | **2.2× faster** |
+| `from_dict` wall time (profiler) | 59.8s | 26.5s | **2.3× faster** |
+| `bits.popcount` calls during build | 20.6M | 406K | **50× fewer** |
+| `to_dict` / warm-up cumulative | 37.6s | 0.3s | **125× faster** |
+| Total function calls | 225M | 92M | **2.4× fewer** |
+
 - **183x faster** build time for co-occurrence dictionaries (5.3s → 0.029s for 37K entries)
 - **99.91% cache hit rate** for typical workloads with key reuse
-- 84x speedup from LRU cache alone
-- 8x faster label access with pre-computed offsets
-- 34% reduction in MarisaTrie lookups via key caching
 
 ## [1.0.0] - 2026-02-15
 
