@@ -154,14 +154,16 @@ class TestCompactTree:
         assert isinstance(louds, LOUDS)
 
     def test_list_children_with_louds_structure(self):
-        """Test _list_children logic with real LOUDS."""
+        """Test _list_children logic with LOUDS-decoded arrays."""
         tree = CompactTree.__new__(CompactTree)
-        
-        # Create LOUDS with root having 3 children
-        louds_bits = bitarray('111')
-        louds = LOUDS(Poppy(louds_bits))
-        tree.louds = louds
-        
+
+        # Proper LOUDS for root with 3 children (all leaves):
+        # root: 1110  (3 children + terminator)
+        # leaf0: 0, leaf1: 0, leaf2: 0
+        louds_bits = bitarray('11100000')
+        tree._louds_ba = louds_bits
+        tree._child_start, tree._child_count = CompactTree._decode_louds(louds_bits)
+
         children = tree._list_children(0)
         assert len(children) == 3
         assert children == [1, 2, 3]

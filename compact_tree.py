@@ -1,12 +1,8 @@
 import gzip
 import struct
 from typing import Any, BinaryIO, Iterator, Optional
-from collections import deque
 
 from bitarray import bitarray
-from succinct.poppy import Poppy
-
-from louds import LOUDS
 from marisa_trie import MarisaTrie
 
 _INTERNAL = 0xFFFFFFFF  # vcol sentinel for internal (non-leaf) nodes
@@ -29,14 +25,38 @@ class CompactTree:
 
     @staticmethod
     def _walk_dict(d: dict[str, Any], keys_out: set[str],
-                   values_out: list[str]) -> None:
-        """Recursively collect all keys and leaf values."""
+                   values_out: set[str],
+                   _seen_ids: Optional[set] = None) -> None:
+        """Recursively collect all keys and unique leaf values.
+
+        Two shortcuts avoid redundant work at scale:
+
+        * **id-based skip**: if the exact same dict *object* is reachable from
+          multiple places in the tree, it is walked only once.
+        * **key-subset skip**: if every key in *d* is already present in
+          *keys_out* (detected via a single C-level ``d.keys() <= keys_out``
+          call), the per-key ``keys_out.add`` loop is skipped entirely and
+          only leaf values are collected.  In a 3-level dict where the 36
+          inner dicts each carry the same 173K key set, this eliminates
+          35 × 173K = 6 M redundant Python-level ``set.add`` calls.
+        """
+        if _seen_ids is None:
+            _seen_ids = set()
+        did = id(d)
+        if did in _seen_ids:
+            return
+        _seen_ids.add(did)
+
+        # C-level subset check: True when all keys are already in keys_out.
+        # Replaces 173K individual set.add no-ops with a single C loop.
+        keys_new = not (d.keys() <= keys_out)
         for k, v in d.items():
-            keys_out.add(k)
-            if isinstance(v, dict):
-                CompactTree._walk_dict(v, keys_out, values_out)
+            if keys_new:
+                keys_out.add(k)
+            if type(v) is dict:
+                CompactTree._walk_dict(v, keys_out, values_out, _seen_ids)
             else:
-                values_out.append(str(v))
+                values_out.add(v if type(v) is str else str(v))
 
     @staticmethod
     def _pack_strings(strings: list[str]) -> bytearray:
@@ -102,12 +122,11 @@ class CompactTree:
         """
         # 1. Collect vocabulary and leaf values
         all_keys: set[str] = set()
-        all_values: list[str] = []
-        cls._walk_dict(data, all_keys, all_values)
+        unique_values: set[str] = set()
+        cls._walk_dict(data, all_keys, unique_values)
 
         # Determine per-trie cache sizes: honour the caller's hint (applied to
         # both tries) or fall back to the exact vocabulary size for each trie.
-        unique_values: set[str] = set(str(v) for v in all_values)
         if vocabulary_size is not None:
             key_cache_size: int = vocabulary_size
             val_cache_size: int = vocabulary_size
@@ -129,44 +148,146 @@ class CompactTree:
         val_id: dict[str, int] = val_trie.to_dict()
 
         # 4. BFS -> LOUDS bits + vcol + elbl
+        import array as _array
         louds_bits = bitarray()
-        vcol_buf = bytearray()
-        elbl_buf = bytearray()
-        queue: deque[Optional[dict]] = deque()
+        elbl_list: list[int] = []
+        vcol_list: list[int] = []
 
-        # Cache (sorted_keys, key_indices) by frozenset of key names so that
-        # sibling dicts with the same key set pay the MarisaTrie lookup cost
-        # only once regardless of how many times that key set appears.
-        _key_order_cache: dict[frozenset, tuple[list[str], dict[str, int]]] = {}
+        # List-based BFS queue with a read-head index.
+        # Entries are either a dict (internal node) or a positive int (the
+        # number of consecutive leaf-rows = False bits to emit in bulk).
+        # This replaces deque + None sentinels, eliminating:
+        #   - 6.2 M deque.append(None) / popleft() calls
+        #   - 6.2 M individual bitarray.append(False) leaf-row calls
+        # Leaf runs between dict children are preserved in the correct LOUDS
+        # BFS order by queuing int counts inline with dict entries.
+        queue: list = []
+        qi: int = 0
+
+        # Pre-built all-False bitarrays for the most common leaf-run lengths,
+        # keyed by run length.  Avoids re-allocating the same bitarray for the
+        # same-schema inner dicts (e.g. 36 dicts all with 173 K leaf children).
+        _leaf_ba_cache: dict[int, bitarray] = {}
+        # Zero-byte buffer cache for _child_start_arr/_child_count_arr leaf fills.
+        # Batches sharing the same size reuse one allocation (avoids repeated
+        # 692 KB bytes() allocations for the 36 same-schema L2 leaf batches).
+        _zero_bytes_cache: dict[int, bytes] = {}
+
+        # Build _child_start and _child_count directly during BFS so we never
+        # need to scan the LOUDS bitarray after construction.  _next_cid tracks
+        # the 1-based LOUDS node id that will be assigned to the NEXT group of
+        # children; it advances only when _emit_children registers degree>0
+        # children for an internal node.  Leaf batches (int queue items) get
+        # zero-filled entries via array.frombytes(bytes(4*n)) — a C-level
+        # memory fill far cheaper than n Python-level .append(0) calls.
+        _next_cid: int = 1
+        _child_start_arr = _array.array('I')
+        _child_count_arr = _array.array('I')
+
+        # Cache (sorted_keys, sorted_ids, key_indices) by frozenset of key
+        # names so that sibling dicts with the same key set pay the lookup
+        # cost only once.  sorted_ids is a plain list[int] so subsequent
+        # elbl_list.extend(sorted_ids) calls are C-level list-to-list copies.
+        _key_order_cache: dict[frozenset, tuple[list[str], list[int], dict[str, int]]] = {}
 
         def _emit_children(node: dict[str, Any]) -> None:
+            nonlocal _next_cid
             keyset = frozenset(node.keys())
             cached = _key_order_cache.get(keyset)
             if cached is None:
                 indices = {k: key_id[k] for k in node.keys()}
                 sorted_keys = sorted(node.keys(), key=lambda k: indices[k])
-                _key_order_cache[keyset] = (sorted_keys, indices)
+                sorted_ids  = list(map(indices.__getitem__, sorted_keys))
+                _key_order_cache[keyset] = (sorted_keys, sorted_ids, indices)
             else:
-                sorted_keys, indices = cached
-            for key in sorted_keys:
-                louds_bits.append(True)
-                elbl_buf.extend(struct.pack("<I", indices[key]))
-                child = node[key]
-                if isinstance(child, dict):
-                    vcol_buf.extend(struct.pack("<I", _INTERNAL))
-                    queue.append(child)
+                sorted_keys, sorted_ids, indices = cached
+            degree = len(sorted_keys)
+            # Record this node's child range before any early return so both
+            # degree==0 and degree>0 paths are covered.
+            _child_start_arr.append(_next_cid)
+            _child_count_arr.append(degree)
+            _next_cid += degree
+            if degree:
+                # Emit degree 1-bits + terminating 0-bit in one C-level call
+                row = bitarray(degree + 1)
+                row.setall(True)
+                row[-1] = False
+                louds_bits.extend(row)
+            else:
+                louds_bits.append(False)
+                return
+            # All-leaf fast-path detection: set(map(type, ...)) is a pure
+            # C-level pass — no Python frame per item, unlike any(genexpr).
+            value_types = set(map(type, node.values()))
+            if dict not in value_types:
+                # All children are leaves.  sorted_ids is a cached list[int],
+                # so extend is a C memory copy.  For vcol, build vals as a
+                # concrete list first so the second map() walks a C array
+                # (direct PyList_GET_ITEM) rather than chaining two iterator
+                # layers (which adds tp_iternext overhead per element).
+                elbl_list.extend(sorted_ids)
+                vals = list(map(node.__getitem__, sorted_keys))
+                if value_types == {str}:
+                    vcol_list.extend(map(val_id.__getitem__, vals))
                 else:
-                    vcol_buf.extend(struct.pack("<I", val_id[str(child)]))
-                    queue.append(None)          # leaf placeholder
-            louds_bits.append(False)
+                    vcol_list.extend(
+                        val_id[v if type(v) is str else str(v)] for v in vals
+                    )
+                queue.append(degree)
+                return
+
+            _elbl = elbl_list.append
+            _vcol = vcol_list.append
+            _queue = queue.append
+            pending_leaves: int = 0
+            for key in sorted_keys:
+                _elbl(indices[key])
+                child = node[key]
+                if type(child) is dict:
+                    _vcol(_INTERNAL)
+                    if pending_leaves:
+                        _queue(pending_leaves)
+                        pending_leaves = 0
+                    _queue(child)
+                else:
+                    _vcol(val_id[child if type(child) is str else str(child)])
+                    pending_leaves += 1
+            if pending_leaves:
+                _queue(pending_leaves)
 
         _emit_children(data)
-        while queue:
-            item = queue.popleft()
-            if item is None:
-                louds_bits.append(False)        # leaf: degree-0
+        while qi < len(queue):
+            item = queue[qi]; qi += 1
+            if type(item) is not dict:
+                # Batch-emit `item` False bits for a run of leaf-rows.
+                n = item
+                ba = _leaf_ba_cache.get(n)
+                if ba is None:
+                    ba = bitarray(n)
+                    ba.setall(False)
+                    _leaf_ba_cache[n] = ba
+                louds_bits.extend(ba)
+                # Leaf nodes have degree=0; fill their array slots with zeros
+                # via C-level frombytes — faster than n×append(0) calls.
+                # Cache the zero buffer so repeated same-size batches
+                # (e.g. 36 L2 nodes all with the same leaf count) reuse one
+                # allocation instead of each creating a fresh bytes(4*n).
+                _bz = _zero_bytes_cache.get(n)
+                if _bz is None:
+                    _bz = bytes(4 * n)
+                    _zero_bytes_cache[n] = _bz
+                _child_start_arr.frombytes(_bz)
+                _child_count_arr.frombytes(_bz)
             else:
                 _emit_children(item)
+
+        # Convert accumulated int lists -> packed little-endian uint32 bytes
+        import sys as _sys
+        _elbl_arr = _array.array('I', elbl_list)
+        _vcol_arr = _array.array('I', vcol_list)
+        if _sys.byteorder != 'little':
+            _elbl_arr.byteswap()
+            _vcol_arr.byteswap()
 
         # 5. Assemble the CompactTree object
         tree = cls.__new__(cls)
@@ -178,9 +299,11 @@ class CompactTree:
         tree._key_vocab_size = key_cache_size
         tree._val_vocab_size = val_cache_size
         ba = louds_bits
-        tree.louds = LOUDS(Poppy(ba), ba)
-        tree.vcol = bytes(vcol_buf)
-        tree.elbl = bytes(elbl_buf)
+        tree._louds_ba = ba
+        tree._child_start = _child_start_arr
+        tree._child_count = _child_count_arr
+        tree.vcol = bytes(_vcol_arr)
+        tree.elbl = bytes(_elbl_arr)
         tree._louds_root_list = tree._list_children(0)
         return tree
 
@@ -243,7 +366,8 @@ class CompactTree:
                 # Read and parse LOUDS section
                 ba = bitarray()
                 ba.frombytes(f.read(louds_len))
-                self.louds = LOUDS(Poppy(ba), ba)
+                self._louds_ba = ba
+                self._child_start, self._child_count = CompactTree._decode_louds(ba)
 
                 # Read vcol and elbl sections
                 self.vcol = f.read(vcol_len)
@@ -276,7 +400,7 @@ class CompactTree:
         
         keys_bytes = self._key_trie.to_bytes()
         val_bytes = self._val_trie.to_bytes()
-        louds_bytes = self.louds._ba.tobytes()
+        louds_bytes = self._louds_ba.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
         
@@ -328,14 +452,45 @@ class CompactTree:
         """Convert a value ID to the corresponding string."""
         return self._val_trie.restore_key(vid)
 
+    @staticmethod
+    def _decode_louds(ba: bitarray):
+        """Decode a LOUDS bitarray into (child_start, child_count) parallel arrays.
+
+        Used only for deserialization (``__init__`` / ``_unpickle_from_bytes``).
+        ``from_dict`` builds these arrays directly during BFS and never calls
+        this method.
+
+        Both outputs are ``array.array('I')`` of length n_nodes.  Query:
+        ``_list_children(v)`` = ``range(child_start[v], child_start[v] + child_count[v])``.
+        """
+        import array as _array
+        from itertools import accumulate, chain, repeat
+        from operator import sub
+
+        # C-level scan: list of 0-bit positions, one per LOUDS node.
+        zp = list(ba.search(bitarray('0')))
+        n = len(zp)
+        if n == 0:
+            return _array.array('I'), _array.array('I')
+
+        # degrees[i] = zp[i] - zp[i-1] - 1  (zp[-1] defined as -1)
+        # Replace Python list comprehension with chained C-level map() calls:
+        #   map(sub, zp, chain((-1,), zp)) gives zp[i] - prev_zp[i]
+        #   outer map(sub, ..., repeat(1)) subtracts the constant 1
+        # No Python-level per-item dispatch — all iteration is in C.
+        prev = list(chain((-1,), zp))   # length n+1; zip stops at n
+        degrees = list(map(sub, map(sub, zp, prev), repeat(1)))
+
+        # child_start via C-level accumulate (initial=1)
+        child_starts = list(accumulate(degrees, initial=1))[:n]
+
+        return _array.array('I', child_starts), _array.array('I', degrees)
+
     def _list_children(self, louds_pos: int) -> list[int]:
         """List all children of a node at a given LOUDS position."""
-        kid = self.louds.first_child(louds_pos)
-        out: list[int] = []
-        while kid is not None:
-            out.append(kid)
-            kid = self.louds.next_sibling(kid)
-        return out
+        start = self._child_start[louds_pos]
+        count = self._child_count[louds_pos]
+        return list(range(start, start + count))
 
     def _find_child(self, kids: list[int], key_vid: int) -> Optional[int]:
         """Return the LOUDS position of the child whose edge label == *key_vid*."""
@@ -466,7 +621,7 @@ class CompactTree:
         # Serialize to an in-memory buffer
         keys_bytes = self._key_trie.to_bytes()
         val_bytes = self._val_trie.to_bytes()
-        louds_bytes = self.louds._ba.tobytes()
+        louds_bytes = self._louds_ba.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
         
@@ -534,7 +689,8 @@ class CompactTree:
         # Read and parse LOUDS section
         ba = bitarray()
         ba.frombytes(f.read(louds_len))
-        tree.louds = LOUDS(Poppy(ba), ba)
+        tree._louds_ba = ba
+        tree._child_start, tree._child_count = CompactTree._decode_louds(ba)
 
         # Read vcol and elbl sections
         tree.vcol = f.read(vcol_len)
