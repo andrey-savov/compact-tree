@@ -263,13 +263,9 @@ class CompactTree:
             else:
                 _emit_children(item)
 
-        # Convert accumulated int lists -> packed little-endian uint32 bytes
-        import sys as _sys
+        # Convert accumulated int lists into uint32 arrays in native byte order
         _elbl_arr = _array.array('I', elbl_list)
         _vcol_arr = _array.array('I', vcol_list)
-        if _sys.byteorder != 'little':
-            _elbl_arr.byteswap()
-            _vcol_arr.byteswap()
 
         # 5. Assemble the CompactTree object
         tree = cls.__new__(cls)
@@ -382,8 +378,14 @@ class CompactTree:
         if sys.byteorder != 'little':
             _cc = array.array('I', _cc); _cc.byteswap()
         child_count_bytes = _cc.tobytes()
-        vcol_bytes = bytes(self.vcol)
-        elbl_bytes = bytes(self.elbl)
+        _vcol = self.vcol
+        if sys.byteorder != 'little':
+            _vcol = array.array('I', _vcol); _vcol.byteswap()
+        vcol_bytes = _vcol.tobytes()
+        _elbl = self.elbl
+        if sys.byteorder != 'little':
+            _elbl = array.array('I', _elbl); _elbl.byteswap()
+        elbl_bytes = _elbl.tobytes()
         
         with fs.open(path, "wb") as raw_stream:
             with self._wrap_write_stream(raw_stream, compression) as f:
@@ -572,8 +574,14 @@ class CompactTree:
         if sys.byteorder != 'little':
             _cc = array.array('I', _cc); _cc.byteswap()
         child_count_bytes = _cc.tobytes()
-        vcol_bytes = bytes(self.vcol)
-        elbl_bytes = bytes(self.elbl)
+        _vcol = self.vcol
+        if sys.byteorder != 'little':
+            _vcol = array.array('I', _vcol); _vcol.byteswap()
+        vcol_bytes = _vcol.tobytes()
+        _elbl = self.elbl
+        if sys.byteorder != 'little':
+            _elbl = array.array('I', _elbl); _elbl.byteswap()
+        elbl_bytes = _elbl.tobytes()
         
         buf.write(b"CTree")
         buf.write(struct.pack("<Q", 5))
