@@ -5,14 +5,13 @@ import struct
 import sys
 from typing import Any, BinaryIO, Iterator, Optional
 
-from bitarray import bitarray
 from marisa_trie import MarisaTrie
 
 _INTERNAL = 0xFFFFFFFF  # vcol sentinel for internal (non-leaf) nodes
 
 
 class CompactTree:
-    """Compact read-only nested dict backed by LOUDS + DAWG + edge labels.
+    """Compact read-only nested dict backed by CSR arrays + DAWG + edge labels.
 
     Two ways to create:
 
@@ -150,35 +149,28 @@ class CompactTree:
         key_id: dict[str, int] = key_trie.to_dict()
         val_id: dict[str, int] = val_trie.to_dict()
 
-        # 4. BFS -> LOUDS bits + vcol + elbl
+        # 4. BFS -> CSR arrays + vcol + elbl
         import array as _array
-        louds_bits = bitarray()
         elbl_list: list[int] = []
         vcol_list: list[int] = []
 
         # List-based BFS queue with a read-head index.
         # Entries are either a dict (internal node) or a positive int (the
-        # number of consecutive leaf-rows = False bits to emit in bulk).
+        # number of consecutive leaf-rows to emit in bulk).
         # This replaces deque + None sentinels, eliminating:
         #   - 6.2 M deque.append(None) / popleft() calls
-        #   - 6.2 M individual bitarray.append(False) leaf-row calls
-        # Leaf runs between dict children are preserved in the correct LOUDS
-        # BFS order by queuing int counts inline with dict entries.
+        #   - 6.2 M individual leaf-row processing calls
+        # Leaf runs between dict children are queued as int counts inline.
         queue: list = []
         qi: int = 0
 
-        # Pre-built all-False bitarrays for the most common leaf-run lengths,
-        # keyed by run length.  Avoids re-allocating the same bitarray for the
-        # same-schema inner dicts (e.g. 36 dicts all with 173 K leaf children).
-        _leaf_ba_cache: dict[int, bitarray] = {}
         # Zero-byte buffer cache for _child_start_arr/_child_count_arr leaf fills.
         # Batches sharing the same size reuse one allocation (avoids repeated
         # 692 KB bytes() allocations for the 36 same-schema L2 leaf batches).
         _zero_bytes_cache: dict[int, bytes] = {}
 
-        # Build _child_start and _child_count directly during BFS so we never
-        # need to scan the LOUDS bitarray after construction.  _next_cid tracks
-        # the 1-based LOUDS node id that will be assigned to the NEXT group of
+        # Build _child_start and _child_count directly during BFS.
+        # _next_cid tracks the 1-based node id assigned to the NEXT group of
         # children; it advances only when _emit_children registers degree>0
         # children for an internal node.  Leaf batches (int queue items) get
         # zero-filled entries via array.frombytes(bytes(4*n)) — a C-level
@@ -210,14 +202,7 @@ class CompactTree:
             _child_start_arr.append(_next_cid)
             _child_count_arr.append(degree)
             _next_cid += degree
-            if degree:
-                # Emit degree 1-bits + terminating 0-bit in one C-level call
-                row = bitarray(degree + 1)
-                row.setall(True)
-                row[-1] = False
-                louds_bits.extend(row)
-            else:
-                louds_bits.append(False)
+            if degree == 0:
                 return
             # All-leaf fast-path detection: set(map(type, ...)) is a pure
             # C-level pass — no Python frame per item, unlike any(genexpr).
@@ -264,12 +249,6 @@ class CompactTree:
             if type(item) is not dict:
                 # Batch-emit `item` False bits for a run of leaf-rows.
                 n = item
-                ba = _leaf_ba_cache.get(n)
-                if ba is None:
-                    ba = bitarray(n)
-                    ba.setall(False)
-                    _leaf_ba_cache[n] = ba
-                louds_bits.extend(ba)
                 # Leaf nodes have degree=0; fill their array slots with zeros
                 # via C-level frombytes — faster than n×append(0) calls.
                 # Cache the zero buffer so repeated same-size batches
@@ -301,13 +280,11 @@ class CompactTree:
         tree._val_trie = val_trie
         tree._key_vocab_size = key_cache_size
         tree._val_vocab_size = val_cache_size
-        ba = louds_bits
-        tree._louds_ba = ba
         tree._child_start = _child_start_arr
         tree._child_count = _child_count_arr
         tree.vcol = _vcol_arr
         tree.elbl = _elbl_arr
-        tree._louds_root_list = tree._list_children(0)
+        tree._root_list = tree._list_children(0)
         return tree
 
     # ------------------------------------------------------------------ #
@@ -332,22 +309,14 @@ class CompactTree:
             with self._wrap_read_stream(raw_stream, compression) as f:
                 # Read header
                 magic, ver = struct.unpack("<5sQ", f.read(13))
-                assert magic == b"CTree" and ver in (3, 4), (
-                    f"Unsupported CompactTree format version {ver}"
+                assert magic == b"CTree" and ver == 5, (
+                    f"Unsupported CompactTree format version {ver} (expected 5)"
                 )
 
-                # Read section lengths (v4 adds key_vocab + val_vocab fields)
-                if ver == 4:
-                    (
-                        keys_len, val_len, louds_len, vcol_len, elbl_len,
-                        _key_vocab_size, _val_vocab_size,
-                    ) = struct.unpack("<QQQQQQQ", f.read(56))
-                else:  # v3 — derive cache sizes from the trie data itself
-                    keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
-                        "<QQQQQ", f.read(40),
-                    )
-                    _key_vocab_size = None
-                    _val_vocab_size = None
+                (
+                    keys_len, val_len, child_count_len, vcol_len, elbl_len,
+                    _key_vocab_size, _val_vocab_size,
+                ) = struct.unpack("<QQQQQQQ", f.read(56))
 
                 # Read and parse keys MarisaTrie
                 keys_bytes = f.read(keys_len)
@@ -363,14 +332,16 @@ class CompactTree:
                     cache_size=_val_vocab_size or None,
                 )
 
-                self._key_vocab_size = _key_vocab_size or self._key_trie._n
-                self._val_vocab_size = _val_vocab_size or self._val_trie._n
+                self._key_vocab_size = _key_vocab_size
+                self._val_vocab_size = _val_vocab_size
 
-                # Read and parse LOUDS section
-                ba = bitarray()
-                ba.frombytes(f.read(louds_len))
-                self._louds_ba = ba
-                self._child_start, self._child_count = CompactTree._decode_louds(ba)
+                # Reconstruct child_start from stored child_count array
+                _cc = array.array('I'); _cc.frombytes(f.read(child_count_len))
+                if sys.byteorder != 'little': _cc.byteswap()
+                from itertools import accumulate as _acc
+                n_nodes = len(_cc)
+                self._child_start = array.array('I', list(_acc(_cc, initial=1))[:n_nodes])
+                self._child_count = _cc
 
                 # Read vcol and elbl sections
                 _vcol = array.array('I'); _vcol.frombytes(f.read(vcol_len))
@@ -385,7 +356,7 @@ class CompactTree:
         self.f = None
         self.mm = None
 
-        self._louds_root_list = self._list_children(0)
+        self._root_list = self._list_children(0)
 
     # ------------------------------------------------------------------ #
     #  serialize                                                           #
@@ -407,24 +378,27 @@ class CompactTree:
         
         keys_bytes = self._key_trie.to_bytes()
         val_bytes = self._val_trie.to_bytes()
-        louds_bytes = self._louds_ba.tobytes()
+        _cc = self._child_count
+        if sys.byteorder != 'little':
+            _cc = array.array('I', _cc); _cc.byteswap()
+        child_count_bytes = _cc.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
         
         with fs.open(path, "wb") as raw_stream:
             with self._wrap_write_stream(raw_stream, compression) as f:
                 f.write(b"CTree")
-                f.write(struct.pack("<Q", 4))
+                f.write(struct.pack("<Q", 5))
                 f.write(struct.pack(
                     "<QQQQQQQ",
-                    len(keys_bytes), len(val_bytes), len(louds_bytes),
+                    len(keys_bytes), len(val_bytes), len(child_count_bytes),
                     len(vcol_bytes), len(elbl_bytes),
-                    getattr(self, "_key_vocab_size", self._key_trie._n),
-                    getattr(self, "_val_vocab_size", self._val_trie._n),
+                    self._key_vocab_size,
+                    self._val_vocab_size,
                 ))
                 f.write(keys_bytes)
                 f.write(val_bytes)
-                f.write(louds_bytes)
+                f.write(child_count_bytes)
                 f.write(vcol_bytes)
                 f.write(elbl_bytes)
 
@@ -445,7 +419,7 @@ class CompactTree:
                 else:
                     out[key] = self._val_trie.restore_key(vv)
             return out
-        return _build(self._louds_root_list)
+        return _build(self._root_list)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
@@ -455,44 +429,10 @@ class CompactTree:
         """Convert a value ID to the corresponding string."""
         return self._val_trie.restore_key(vid)
 
-    @staticmethod
-    def _decode_louds(ba: bitarray):
-        """Decode a LOUDS bitarray into (child_start, child_count) parallel arrays.
-
-        Used only for deserialization (``__init__`` / ``_unpickle_from_bytes``).
-        ``from_dict`` builds these arrays directly during BFS and never calls
-        this method.
-
-        Both outputs are ``array.array('I')`` of length n_nodes.  Query:
-        ``_list_children(v)`` = ``range(child_start[v], child_start[v] + child_count[v])``.
-        """
-        import array as _array
-        from itertools import accumulate, chain, repeat
-        from operator import sub
-
-        # C-level scan: list of 0-bit positions, one per LOUDS node.
-        zp = list(ba.search(bitarray('0')))
-        n = len(zp)
-        if n == 0:
-            return _array.array('I'), _array.array('I')
-
-        # degrees[i] = zp[i] - zp[i-1] - 1  (zp[-1] defined as -1)
-        # Replace Python list comprehension with chained C-level map() calls:
-        #   map(sub, zp, chain((-1,), zp)) gives zp[i] - prev_zp[i]
-        #   outer map(sub, ..., repeat(1)) subtracts the constant 1
-        # No Python-level per-item dispatch — all iteration is in C.
-        prev = list(chain((-1,), zp))   # length n+1; zip stops at n
-        degrees = list(map(sub, map(sub, zp, prev), repeat(1)))
-
-        # child_start via C-level accumulate (initial=1)
-        child_starts = list(accumulate(degrees, initial=1))[:n]
-
-        return _array.array('I', child_starts), _array.array('I', degrees)
-
-    def _list_children(self, louds_pos: int) -> list[int]:
-        """List all children of a node at a given LOUDS position."""
-        start = self._child_start[louds_pos]
-        count = self._child_count[louds_pos]
+    def _list_children(self, pos: int) -> list[int]:
+        """List all children of a node at a given position."""
+        start = self._child_start[pos]
+        count = self._child_count[pos]
         return list(range(start, start + count))
 
     def _find_child(self, v: int, key_vid: int) -> Optional[int]:
@@ -508,7 +448,7 @@ class CompactTree:
         hi = lo + count                # exclusive upper bound
         pos = bisect.bisect_left(self.elbl, key_vid, lo, hi)
         if pos < hi and self.elbl[pos] == key_vid:
-            return pos + 1             # back to 1-indexed LOUDS position
+            return pos + 1             # back to 1-indexed node position
         return None
 
     def _resolve(self, child_pos: int) -> "str | CompactTree._Node":
@@ -587,7 +527,7 @@ class CompactTree:
         return self._resolve(child_pos)
 
     def __iter__(self) -> Iterator[str]:
-        for kid in self._louds_root_list:
+        for kid in self._root_list:
             yield self._key_trie.restore_key(self.elbl[kid - 1])
 
     def __contains__(self, key: str) -> bool:
@@ -598,7 +538,7 @@ class CompactTree:
         return self._find_child(0, key_vid) is not None
 
     def __len__(self) -> int:
-        return len(self._louds_root_list)
+        return len(self._root_list)
 
     def __repr__(self) -> str:
         """Return an interpretable representation of the CompactTree."""
@@ -628,22 +568,25 @@ class CompactTree:
         # Serialize to an in-memory buffer
         keys_bytes = self._key_trie.to_bytes()
         val_bytes = self._val_trie.to_bytes()
-        louds_bytes = self._louds_ba.tobytes()
+        _cc = self._child_count
+        if sys.byteorder != 'little':
+            _cc = array.array('I', _cc); _cc.byteswap()
+        child_count_bytes = _cc.tobytes()
         vcol_bytes = bytes(self.vcol)
         elbl_bytes = bytes(self.elbl)
         
         buf.write(b"CTree")
-        buf.write(struct.pack("<Q", 4))
+        buf.write(struct.pack("<Q", 5))
         buf.write(struct.pack(
             "<QQQQQQQ",
-            len(keys_bytes), len(val_bytes), len(louds_bytes),
+            len(keys_bytes), len(val_bytes), len(child_count_bytes),
             len(vcol_bytes), len(elbl_bytes),
-            getattr(self, "_key_vocab_size", self._key_trie._n),
-            getattr(self, "_val_vocab_size", self._val_trie._n),
+            self._key_vocab_size,
+            self._val_vocab_size,
         ))
         buf.write(keys_bytes)
         buf.write(val_bytes)
-        buf.write(louds_bytes)
+        buf.write(child_count_bytes)
         buf.write(vcol_bytes)
         buf.write(elbl_bytes)
 
@@ -658,22 +601,14 @@ class CompactTree:
         
         # Read header
         magic, ver = struct.unpack("<5sQ", f.read(13))
-        assert magic == b"CTree" and ver in (3, 4), (
-            f"Unsupported CompactTree format version {ver}"
+        assert magic == b"CTree" and ver == 5, (
+            f"Unsupported CompactTree format version {ver} (expected 5)"
         )
 
-        # Read section lengths (v4 adds key_vocab + val_vocab fields)
-        if ver == 4:
-            (
-                keys_len, val_len, louds_len, vcol_len, elbl_len,
-                _key_vocab_size, _val_vocab_size,
-            ) = struct.unpack("<QQQQQQQ", f.read(56))
-        else:  # v3 — derive cache sizes from the trie data itself
-            keys_len, val_len, louds_len, vcol_len, elbl_len = struct.unpack(
-                "<QQQQQ", f.read(40),
-            )
-            _key_vocab_size = None
-            _val_vocab_size = None
+        (
+            keys_len, val_len, child_count_len, vcol_len, elbl_len,
+            _key_vocab_size, _val_vocab_size,
+        ) = struct.unpack("<QQQQQQQ", f.read(56))
 
         # Read and parse keys MarisaTrie
         tree = CompactTree.__new__(CompactTree)
@@ -690,14 +625,16 @@ class CompactTree:
             cache_size=_val_vocab_size or None,
         )
 
-        tree._key_vocab_size = _key_vocab_size or tree._key_trie._n
-        tree._val_vocab_size = _val_vocab_size or tree._val_trie._n
+        tree._key_vocab_size = _key_vocab_size
+        tree._val_vocab_size = _val_vocab_size
 
-        # Read and parse LOUDS section
-        ba = bitarray()
-        ba.frombytes(f.read(louds_len))
-        tree._louds_ba = ba
-        tree._child_start, tree._child_count = CompactTree._decode_louds(ba)
+        # Reconstruct child_start from stored child_count array
+        _cc = array.array('I'); _cc.frombytes(f.read(child_count_len))
+        if sys.byteorder != 'little': _cc.byteswap()
+        from itertools import accumulate as _acc
+        n_nodes = len(_cc)
+        tree._child_start = array.array('I', list(_acc(_cc, initial=1))[:n_nodes])
+        tree._child_count = _cc
 
         # Read vcol and elbl sections
         _vcol = array.array('I'); _vcol.frombytes(f.read(vcol_len))
@@ -712,5 +649,5 @@ class CompactTree:
         tree.f = None
         tree.mm = None
 
-        tree._louds_root_list = tree._list_children(0)
+        tree._root_list = tree._list_children(0)
         return tree

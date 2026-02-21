@@ -14,19 +14,20 @@ class MarisaTrie:
 
     Ingests an iterable of strings, deduplicates, and builds an in-memory
     path-compressed radix trie with subtree word counts for minimal perfect
-    hashing.  LOUDS is built lazily *only* during serialization and is never
-    stored on the live instance.
+    hashing.
 
     Supports:
 
     * ``index(word)``      - dense unique index in [0, N)
     * ``restore_key(idx)`` - word from index
-    * Serialize / deserialize to disk (compact LOUDS binary format)
+    * Serialize / deserialize to disk (compact binary format)
 
     At query time, navigation uses plain Python parallel lists
     (``_node_labels``, ``_node_children``, ``_node_counts``,
-    ``_node_terminal``) rather than rank-/select-based LOUDS traversal,
-    giving plain list-indexing speed with zero Poppy overhead.
+    ``_node_terminal``) with plain list-indexing — no rank/select overhead.
+
+    The binary format uses CSR (child_count + flat_children) arrays, so
+    deserialization is a direct ``frombytes`` with no rank/select computation.
 
     ``cache_size`` controls the ``lru_cache`` capacity installed on each
     instance's ``index()`` method.  When ``None``, defaults to the full
@@ -91,7 +92,7 @@ class MarisaTrie:
 
         Populates ``_root_children``, ``_node_labels``, ``_node_terminal``,
         ``_node_children``, and ``_node_counts``.  All node arrays are in
-        BFS order so that ``to_bytes()`` can emit LOUDS bits without any
+        BFS order so that ``to_bytes()`` can emit CSR arrays without any
         additional traversal.
         """
         node_labels:   list[str]       = []
@@ -398,17 +399,19 @@ class MarisaTrie:
             raise ValueError(f"Unsupported compression: {compression}")
 
     # ------------------------------------------------------------------ #
-    #  Serialization: LOUDS built here, never stored on the instance      #
+    #  Serialization: CSR arrays, never stored on the instance           #
     # ------------------------------------------------------------------ #
 
     def to_bytes(self) -> bytes:
-        """Serialize the trie to bytes.
+        """Serialize the trie to bytes (CSR arrays).
 
         Result is cached on the instance after the first call — the trie is
         immutable so the bytes never change.
 
-        LOUDS is constructed on the fly from the in-memory arrays (which are
-        already in BFS order) and is **not** stored back on the instance.
+        CSR arrays (``child_count`` + ``flat_children``) are built on the
+        fly from the in-memory arrays and are **not** stored back on the
+        instance.  Deserialization reconstructs the parallel lists with a
+        single ``frombytes`` pass at O(N) with no rank/select computation.
 
         Returns:
             Binary representation of the trie.
@@ -420,21 +423,6 @@ class MarisaTrie:
 
         num_nodes = len(self._node_labels)
 
-        # Build LOUDS bit-vector from arrays.
-        # Arrays are in BFS order, so each row is trivial:
-        #   root row  : len(_root_children) 1-bits + 1 0-bit
-        #   node i row: len(_node_children[i]) 1-bits + 1 0-bit
-        louds_bits = bitarray()
-        n_root_ch  = len(self._root_children)
-        if n_root_ch:
-            louds_bits.extend(bitarray(n_root_ch * "1"))
-        louds_bits.append(False)
-        for i in range(num_nodes):
-            n_ch = len(self._node_children[i])
-            if n_ch:
-                louds_bits.extend(bitarray(n_ch * "1"))
-            louds_bits.append(False)
-
         # Labels, terminal bits, counts in BFS order (= array order)
         labels_buf    = bytearray()
         terminal_bits = bitarray()
@@ -445,24 +433,45 @@ class MarisaTrie:
             terminal_bits.append(self._node_terminal[i])
 
         counts_bytes   = struct.pack(f"<{num_nodes}I", *self._node_counts) if num_nodes else b""
-        louds_bytes    = louds_bits.tobytes()
         labels_bytes   = bytes(labels_buf)
-        terminal_bytes = terminal_bits.tobytes()
+        terminal_bytes = terminal_bits.tobytes() if num_nodes else b""
+
+        # Build CSR arrays.
+        # child_count[0]   = len(_root_children)
+        # child_count[i+1] = len(_node_children[i])  for i in 0..num_nodes-1
+        # flat_children    = _root_children ++ concat(_node_children)
+        import array as _array
+        import sys as _sys
+        all_counts: list[int] = [len(self._root_children)]
+        flat:       list[int] = list(self._root_children)
+        for ch in self._node_children:
+            all_counts.append(len(ch))
+            flat.extend(ch)
+
+        cc_arr = _array.array('I', all_counts)
+        fc_arr = _array.array('I', flat) if flat else _array.array('I')
+        if _sys.byteorder != 'little':
+            cc_arr.byteswap()
+            fc_arr.byteswap()
+        child_count_bytes   = cc_arr.tobytes()
+        flat_children_bytes = fc_arr.tobytes()
 
         buf = io.BytesIO()
         buf.write(b"MTrie")
-        buf.write(struct.pack("<Q", 1))          # version 1
+        buf.write(struct.pack("<Q", 2))          # version 2
         buf.write(struct.pack("<Q", self._n))
         buf.write(struct.pack("<?", self._root_is_terminal))
-        buf.write(struct.pack("<QQQQ",
-                              len(louds_bytes),
+        buf.write(struct.pack("<QQQQQ",
                               len(labels_bytes),
                               len(terminal_bytes),
-                              len(counts_bytes)))
-        buf.write(louds_bytes)
+                              len(counts_bytes),
+                              len(child_count_bytes),
+                              len(flat_children_bytes)))
         buf.write(labels_bytes)
         buf.write(terminal_bytes)
         buf.write(counts_bytes)
+        buf.write(child_count_bytes)
+        buf.write(flat_children_bytes)
         result = buf.getvalue()
         self._cached_bytes = result
         return result
@@ -476,8 +485,8 @@ class MarisaTrie:
     ) -> "MarisaTrie":
         """Deserialize a trie from bytes, reconstructing the runtime arrays.
 
-        LOUDS is read from the byte stream, used *once* to rebuild the
-        ``_node_children`` lists, then discarded (not stored on the instance).
+        Reconstruction is a direct ``frombytes`` over CSR arrays with no
+        rank/select computation.
 
         Args:
             data: Binary representation produced by ``to_bytes()``.
@@ -488,28 +497,27 @@ class MarisaTrie:
             Reconstructed ``MarisaTrie``.
         """
         import io
-        from succinct.poppy import Poppy
-        from louds import LOUDS as _LOUDS
+        import array as _array
+        import sys as _sys
 
         f = io.BytesIO(data)
         magic, ver = struct.unpack("<5sQ", f.read(13))
-        assert magic == b"MTrie" and ver == 1, f"Invalid format: {magic!r} v{ver}"
+        assert magic == b"MTrie" and ver == 2, f"Invalid format: {magic!r} v{ver} (expected 2)"
 
         n                = struct.unpack("<Q", f.read(8))[0]
         root_is_terminal = struct.unpack("<?", f.read(1))[0]
-        louds_len, labels_len, terminal_len, counts_len = struct.unpack("<QQQQ", f.read(32))
 
-        louds_raw      = f.read(louds_len)
-        labels_bytes   = f.read(labels_len)
-        terminal_bytes = f.read(terminal_len)
-        counts_bytes   = f.read(counts_len)
+        # layout: labels | terminal | counts | child_count | flat_children
+        labels_len, terminal_len, counts_len, child_count_len, flat_children_len = (
+            struct.unpack("<QQQQQ", f.read(40))
+        )
+        labels_bytes        = f.read(labels_len)
+        terminal_bytes      = f.read(terminal_len)
+        counts_bytes        = f.read(counts_len)
+        child_count_bytes   = f.read(child_count_len)
+        flat_children_bytes = f.read(flat_children_len)
 
         num_nodes = counts_len // 4
-
-        # Reconstruct LOUDS - used only to rebuild _node_children, then dropped
-        louds_ba = bitarray()
-        louds_ba.frombytes(louds_raw)
-        louds_obj = _LOUDS(Poppy(louds_ba), louds_ba)
 
         # Parse labels, terminal bits, counts
         node_labels:   list[str]  = []
@@ -531,21 +539,19 @@ class MarisaTrie:
                 struct.unpack("<I", counts_bytes[i * 4:(i + 1) * 4])[0]
             )
 
-        # Rebuild children lists from LOUDS (one BFS pass, then discard).
-        # LOUDS node numbering: root = 0; LOUDS node v -> array index v-1.
-        node_children: list[list[int]] = [[] for _ in range(num_nodes)]
-        root_children: list[int]       = []
-
-        def _collect(louds_node: int, dest: list) -> None:
-            child = louds_obj.first_child(louds_node)
-            while child is not None:
-                dest.append(child - 1)
-                child = louds_obj.next_sibling(child)
-
-        _collect(0, root_children)
-        for v in range(1, num_nodes + 1):
-            _collect(v, node_children[v - 1])
-        # louds_obj goes out of scope here - not stored on trie
+        # Reconstruct children directly from CSR arrays — no rank/select.
+        cc = _array.array('I'); cc.frombytes(child_count_bytes)
+        fc = _array.array('I'); fc.frombytes(flat_children_bytes)
+        if _sys.byteorder != 'little':
+            cc.byteswap()
+            fc.byteswap()
+        fc_off = cc[0]
+        root_children: list[int]       = list(fc[0:fc_off])
+        node_children: list[list[int]] = []
+        for i in range(num_nodes):
+            cnt = cc[i + 1]
+            node_children.append(list(fc[fc_off:fc_off + cnt]))
+            fc_off += cnt
 
         trie = cls.__new__(cls)
         trie._n                = n
