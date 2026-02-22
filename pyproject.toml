@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0,<77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,7 @@ version = "2.1.0"
 description = "Compact, read-only nested dictionary backed by a DAWG-style radix trie"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+license = {text = "MIT"}
 authors = [
     {name = "Andrey Savov", email = "savov@hotmail.com"}
 ]
@@ -66,4 +66,23 @@ exclude_lines = [
     "raise NotImplementedError",
     "if __name__ == .__main__.:",
 ]
+
+[tool.cibuildwheel]
+# Build for CPython 3.9–3.13; skip 32-bit and musl targets
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-win32 *-manylinux_i686 *-musllinux_*"
+# Run the test suite after each wheel build
+test-requires = ["pytest", "bitarray", "fsspec"]
+test-command = "pytest {project}/test_compact_tree.py {project}/test_marisa_trie.py -x -q"
+
+[tool.cibuildwheel.linux]
+# archs are set per-runner via CIBW_ARCHS_LINUX in the workflow matrix
+# (two parallel jobs: x86_64 and aarch64)
+
+[tool.cibuildwheel.macos]
+# archs are set per-runner via CIBW_ARCHS_MACOS in the workflow matrix
+# (two parallel jobs: arm64 and x86_64)
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
 
