@@ -23,7 +23,11 @@ Usage
   python profile_synthetic.py --mode lookup --use-parquet --parquet-sorted  # PyArrow sorted + bisect
   python profile_synthetic.py --mode build  --use-parquet          # profile PyArrow table construction
   python profile_synthetic.py --mode both   --use-parquet          # profile table build + lookup
+  python profile_synthetic.py --mode lookup --use-parquet-map      # PyArrow nested map column lookup
+  python profile_synthetic.py --mode build  --use-parquet-map      # profile nested map table construction
 """
+
+from __future__ import annotations
 
 import argparse
 import cProfile
@@ -34,8 +38,11 @@ import pstats
 import random
 import tempfile
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Generator, Optional
 from pathlib import Path
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 from compact_tree import CompactTree
 
@@ -43,7 +50,7 @@ from compact_tree import CompactTree
 # N-gram permutation generator
 # ---------------------------------------------------------------------------
 
-def _ngram_permutations(words: list[str], max_n: int = 7):
+def _ngram_permutations(words: list[str], max_n: int = 7) -> Generator[str, None, None]:
     """Yield ' '.join(perm) for every window of size n=1..max_n in *words*,
     iterating all permutations of each window."""
     for n in range(1, max_n + 1):
@@ -89,7 +96,7 @@ L1_KEYS = 4
 VALUE_POOL_CAP = 10_000   # cap unique leaf values to keep pre-warm tractable
 
 
-def build_dict(l2_keys: int = 173_000) -> dict:
+def build_dict(l2_keys: int = 173_000) -> dict[str, dict[str, dict[str, str]]]:
     """Build the 3-level nested dict using corpus n-gram permutations."""
     corpus_path = Path(__file__).parent / "corpus.txt"
 
@@ -133,7 +140,7 @@ def build_dict(l2_keys: int = 173_000) -> dict:
 # PyArrow table helpers
 # ---------------------------------------------------------------------------
 
-def dict_to_arrow_table(d: dict, sorted_table: bool = False):
+def dict_to_arrow_table(d: dict[str, dict[str, dict[str, str]]], sorted_table: bool = False) -> pa.Table:
     """Flatten the 3-level dict to a PyArrow table with 4 string columns.
 
     Columns: ``l0_key``, ``l1_key``, ``l2_key``, ``value``.
@@ -175,7 +182,7 @@ def dict_to_arrow_table(d: dict, sorted_table: bool = False):
     )
 
     if sorted_table:
-        import pyarrow.compute as pc  # noqa: F401 — needed for sort_indices
+        import pyarrow.compute as pc
         skey_col = [
             k0 + "\x00" + k1 + "\x00" + k2
             for k0, k1, k2 in zip(l0_col, l1_col, l2_col)
@@ -183,25 +190,25 @@ def dict_to_arrow_table(d: dict, sorted_table: bool = False):
         table = table.append_column(
             "_skey", pa.array(skey_col, type=pa.string())
         )
-        sort_idx = pa.compute.sort_indices(table, sort_keys=[("_skey", "ascending")])
+        sort_idx = pc.sort_indices(table, sort_keys=[("_skey", "ascending")])  # type: ignore[attr-defined]
         table = table.take(sort_idx)
 
     return table
 
 
-def parquet_filter_lookup(table, k0: str, k1: str, k2: str) -> str:
+def parquet_filter_lookup(table: pa.Table, k0: str, k1: str, k2: str) -> str:
     """Point lookup on an unsorted PyArrow table using ``pc.equal`` + ``table.filter``.
 
     Raises :class:`KeyError` when no matching row is found.
     """
     import pyarrow.compute as pc
 
-    mask = pc.and_(
-        pc.and_(
-            pc.equal(table.column("l0_key"), k0),
-            pc.equal(table.column("l1_key"), k1),
+    mask = pc.and_(  # type: ignore[attr-defined]
+        pc.and_(  # type: ignore[attr-defined]
+            pc.equal(table.column("l0_key"), k0),  # type: ignore[attr-defined]
+            pc.equal(table.column("l1_key"), k1),  # type: ignore[attr-defined]
         ),
-        pc.equal(table.column("l2_key"), k2),
+        pc.equal(table.column("l2_key"), k2),  # type: ignore[attr-defined]
     )
     result = table.filter(mask)
     if result.num_rows == 0:
@@ -210,7 +217,7 @@ def parquet_filter_lookup(table, k0: str, k1: str, k2: str) -> str:
 
 
 def parquet_sorted_lookup(
-    table,
+    table: pa.Table,
     skey_list: list[str],
     k0: str,
     k1: str,
@@ -234,7 +241,7 @@ def parquet_sorted_lookup(
     return table.column("value")[idx].as_py()
 
 
-def profile_parquet_build(d: dict, parquet_sorted: bool = False):
+def profile_parquet_build(d: dict[str, dict[str, dict[str, str]]], parquet_sorted: bool = False) -> pa.Table:
     """Profile :func:`dict_to_arrow_table` and print a cProfile summary.
 
     Returns the built table so the caller can pass it directly to
@@ -257,16 +264,112 @@ def profile_parquet_build(d: dict, parquet_sorted: bool = False):
     return table
 
 
+def dict_to_arrow_map_table(d: dict[str, dict[str, dict[str, str]]]) -> pa.Table:
+    """Build a single-cell PyArrow table using a triply-nested map column.
+
+    The table has **exactly 1 row** and **1 column**:
+
+    * ``data`` — ``map<string, map<string, map<string, string>>>``
+                 the entire 3-level dict stored in one PyArrow map scalar.
+
+    Lookup is performed by chaining ``pc.map_lookup`` + ``pc.list_flatten``
+    three times, keeping all data in Arrow memory until the final string
+    value is extracted with a single ``.as_py()`` call.
+    """
+    import pyarrow as pa  # lazy import
+
+    l2_type  = pa.map_(pa.string(), pa.string())
+    l1_type  = pa.map_(pa.string(), l2_type)
+    l0_type  = pa.map_(pa.string(), l1_type)
+
+    # Build the single cell value: a list of (k0, [(k1, [(k2, v) ...]) ...])
+    l0_pairs: list[tuple] = []
+    for k0, sub1 in d.items():
+        l1_pairs: list[tuple] = []
+        for k1, sub2 in sub1.items():
+            l1_pairs.append((k1, list(sub2.items())))
+        l0_pairs.append((k0, l1_pairs))
+
+    return pa.table(
+        {"data": pa.array([l0_pairs], type=l0_type)},
+        schema=pa.schema([("data", l0_type)]),
+    )
+
+
+def parquet_map_lookup(table: pa.Table, k0: str, k1: str, k2: str) -> str:
+    """Point lookup on a single-cell triply-nested-map PyArrow table.
+
+    All three levels are traversed in Arrow-land using chained
+    ``pc.map_lookup`` + ``pc.list_flatten`` calls (both C++).  Only the
+    final matched string scalar is materialised via ``.as_py()``.
+
+    Chain::
+
+        col  : MapArray<str, map<str, map<str, str>>>   (1 element)
+         → map_lookup(k0) → ListArray<map<str, map<str,str>>>  (1 element)
+         → list_flatten   → MapArray<str, map<str,str>>        (0 or 1)
+         → map_lookup(k1) → ListArray<map<str,str>>            (0 or 1)
+         → list_flatten   → MapArray<str,str>                  (0 or 1)
+         → map_lookup(k2) → ListArray<str>                     (0 or 1)
+         → list_flatten   → StringArray                        (0 or 1)
+
+    Raises :class:`KeyError` on any miss.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    col = table.column("data")  # 1-element MapArray
+
+    l1_list = pc.map_lookup(col, pa.scalar(k0, pa.string()), "all")  # type: ignore[attr-defined]
+    l1_flat = pc.list_flatten(l1_list)  # type: ignore[attr-defined]  # MapArray<str,map<str,str>>
+    if len(l1_flat) == 0:
+        raise KeyError((k0, k1, k2))
+
+    l2_list = pc.map_lookup(l1_flat, pa.scalar(k1, pa.string()), "all")  # type: ignore[attr-defined]
+    l2_flat = pc.list_flatten(l2_list)  # type: ignore[attr-defined]  # MapArray<str,str>
+    if len(l2_flat) == 0:
+        raise KeyError((k0, k1, k2))
+
+    val_list = pc.map_lookup(l2_flat, pa.scalar(k2, pa.string()), "all")  # type: ignore[attr-defined]
+    val_flat = pc.list_flatten(val_list)  # type: ignore[attr-defined]  # StringArray
+    if len(val_flat) == 0:
+        raise KeyError((k0, k1, k2))
+
+    return val_flat[0].as_py()
+
+
+def profile_parquet_map_build(d: dict[str, dict[str, dict[str, str]]]) -> pa.Table:
+    """Profile :func:`dict_to_arrow_map_table` and print a cProfile summary.
+
+    Returns the built table so the caller can reuse it in subsequent lookup
+    profiling without rebuilding (``--mode both --use-parquet-map``).
+    """
+    print("\nProfiling dict_to_arrow_map_table() [1-row map<str,map<str,map<str,str>>>] ...")
+
+    profiler = cProfile.Profile()
+    wall_start = time.perf_counter()
+    profiler.enable()
+    table = dict_to_arrow_map_table(d)
+    profiler.disable()
+    wall_elapsed = time.perf_counter() - wall_start
+
+    print(f"  Wall time: {wall_elapsed:.3f}s")
+    print(f"  Rows: {table.num_rows:,}  |  Size: {table.nbytes / 1_048_576:.1f} MiB")
+
+    _print_profile_stats(profiler)
+    return table
+
+
 # ---------------------------------------------------------------------------
 # Profiling
 # ---------------------------------------------------------------------------
 
-def profile_ingestion(d: dict, vocabulary_size: Optional[int] = None) -> CompactTree:
+def profile_ingestion(d: dict[str, dict[str, dict[str, str]]], vocabulary_size: Optional[int] = None) -> CompactTree:
     """Profile CompactTree.from_dict(d) and print a summary."""
     # Estimate unique keys and values to size the LRU cache exactly.
     all_keys: set[str] = set()
     all_values: set[str] = set()
-    def _walk(node: dict) -> None:
+    def _walk(node: dict[str, Any]) -> None:
         for k, v in node.items():
             all_keys.add(k)
             if isinstance(v, dict):
@@ -352,14 +455,16 @@ def _print_profile_stats(
 
 def profile_lookup(
     tree: Optional[CompactTree],
-    d: dict,
+    d: dict[str, dict[str, dict[str, str]]],
     duration: float = 10.0,
     miss_ratio: float = 0.1,
     use_get_path: bool = False,
     use_dict: bool = False,
     use_parquet: bool = False,
     parquet_sorted: bool = False,
-    parquet_table: Optional[object] = None,
+    parquet_table: Optional[pa.Table] = None,
+    use_parquet_map: bool = False,
+    parquet_map_table: Optional[pa.Table] = None,
 ) -> None:
     """Profile random leaf lookups for approximately *duration* seconds.
 
@@ -375,11 +480,14 @@ def profile_lookup(
     * default — ``tree[k0][k1][k2]`` against the CompactTree
     * ``use_get_path`` — ``tree.get_path(k0, k1, k2)``
     * ``use_dict`` — ``d[k0][k1][k2]`` against the plain Python dict
-    * ``use_parquet`` — PyArrow table lookup (filter-based or sorted bisect)
+    * ``use_parquet`` — flat 4-column PyArrow table (filter or sorted bisect)
+    * ``use_parquet_map`` — 1-row map<str,map<str,map<str,str>>> column;
+                            3× ``pc.map_lookup`` + ``pc.list_flatten`` (all C++)
 
-    When *use_parquet* is True and *parquet_table* is None the table is built
-    from *d* here (outside the timed loop).  Pass a pre-built table (e.g. from
-    :func:`profile_parquet_build`) to avoid building it twice in ``--mode both``.
+    When *use_parquet* / *use_parquet_map* is True and the corresponding table
+    is None, the table is built from *d* here (outside the timed loop).  Pass
+    a pre-built table (e.g. from :func:`profile_parquet_build`) to avoid
+    building it twice in ``--mode both``.
     """
     # Extract key lists once — tiny: 9, 4, 173K entries.
     l0_keys = list(d.keys())
@@ -395,14 +503,25 @@ def profile_lookup(
     # ------------------------------------------------------------------
     skey_list: Optional[list[str]] = None  # only used by parquet_sorted path
 
-    if use_parquet:
+    if use_parquet_map:
+        if parquet_map_table is None:
+            print("  Building PyArrow nested-map table from dict (unprofiled)...")
+            t0 = time.perf_counter()
+            parquet_map_table = dict_to_arrow_map_table(d)
+            print(f"  Table built in {time.perf_counter() - t0:.3f}s")
+        assert parquet_map_table is not None
+        print(f"  Table: {parquet_map_table.num_rows:,} rows, "
+              f"{parquet_map_table.nbytes / 1_048_576:.1f} MiB")
+        print("  Using PyArrow nested-map (3× pc.map_lookup + pc.list_flatten, 1 .as_py())")
+    elif use_parquet:
         if parquet_table is None:
             print("  Building PyArrow table from dict (unprofiled)...")
             t0 = time.perf_counter()
             parquet_table = dict_to_arrow_table(d, sorted_table=parquet_sorted)
-            print(f"  Table built in {time.perf_counter() - t0:.3f}s  "
-                  f"({parquet_table.num_rows:,} rows, "
-                  f"{parquet_table.nbytes / 1_048_576:.1f} MiB)")
+            print(f"  Table built in {time.perf_counter() - t0:.3f}s")
+        assert parquet_table is not None
+        print(f"  Table: {parquet_table.num_rows:,} rows, "
+              f"{parquet_table.nbytes / 1_048_576:.1f} MiB")
         if parquet_sorted:
             print("  Extracting _skey list for bisect (one-time)...")
             skey_list = parquet_table.column("_skey").to_pylist()
@@ -438,8 +557,11 @@ def profile_lookup(
                 # Guaranteed miss: swap k2 for a key from the wrong level.
                 k2 = l0_keys[rng.randrange(n0)]
                 try:
-                    if use_parquet:
+                    if use_parquet_map:
+                        _ = parquet_map_lookup(parquet_map_table, k0, k1, k2)  # type: ignore[arg-type]
+                    elif use_parquet:
                         if parquet_sorted:
+                            assert skey_list is not None
                             _ = parquet_sorted_lookup(parquet_table, skey_list, k0, k1, k2)
                         else:
                             _ = parquet_filter_lookup(parquet_table, k0, k1, k2)
@@ -452,8 +574,11 @@ def profile_lookup(
                 except KeyError:
                     pass
             else:
-                if use_parquet:
+                if use_parquet_map:
+                    _ = parquet_map_lookup(parquet_map_table, k0, k1, k2)  # type: ignore[arg-type]
+                elif use_parquet:
                     if parquet_sorted:
+                        assert skey_list is not None
                         _ = parquet_sorted_lookup(parquet_table, skey_list, k0, k1, k2)
                     else:
                         _ = parquet_filter_lookup(parquet_table, k0, k1, k2)
@@ -609,6 +734,18 @@ if __name__ == "__main__":
             "add --parquet-sorted for O(log N) bisect on a pre-sorted table."
         ),
     )
+    target_group.add_argument(
+        "--use-parquet-map",
+        action="store_true",
+        default=False,
+        dest="use_parquet_map",
+        help=(
+            "Benchmark a compact PyArrow table with a nested map column "
+            "(map<string, map<string, string>>). "
+            "Lookup uses pc.map_lookup (C++) + Python dict for the final level. "
+            "Supported with --mode build, lookup, and both."
+        ),
+    )
 
     parser.add_argument(
         "--parquet-sorted",
@@ -636,6 +773,8 @@ if __name__ == "__main__":
         parser.error("--parquet-sorted requires --use-parquet")
     if args.use_parquet and args.mode in ("serialize", "deserialize", "serde"):
         parser.error("--use-parquet is not supported with serde modes (serialize/deserialize/serde)")
+    if args.use_parquet_map and args.mode in ("serialize", "deserialize", "serde"):
+        parser.error("--use-parquet-map is not supported with serde modes (serialize/deserialize/serde)")
 
     # Resolve L2 size: explicit > mode default > global default
     if args.l2 is not None:
@@ -650,19 +789,14 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Build phase
     # ------------------------------------------------------------------
-    parquet_table: Optional[object] = None  # set when --use-parquet is active
+    parquet_table: Optional[pa.Table] = None       # set when --use-parquet is active
+    parquet_map_table: Optional[pa.Table] = None   # set when --use-parquet-map is active
 
-    if args.use_parquet:
-        if args.mode in ("build", "both"):
-            parquet_table = profile_parquet_build(d, parquet_sorted=args.parquet_sorted)
-        else:
-            # lookup mode: build silently, will be passed into profile_lookup
-            print("\nBuilding PyArrow table (unprofiled)...")
-            t0 = time.perf_counter()
-            parquet_table = dict_to_arrow_table(d, sorted_table=args.parquet_sorted)
-            print(f"  Table built in {time.perf_counter() - t0:.3f}s  "
-                  f"({parquet_table.num_rows:,} rows, "
-                  f"{parquet_table.nbytes / 1_048_576:.1f} MiB)")
+    if args.use_parquet_map:
+        parquet_map_table = profile_parquet_map_build(d)
+        tree = None  # CompactTree not needed when benchmarking PyArrow map
+    elif args.use_parquet:
+        parquet_table = profile_parquet_build(d, parquet_sorted=args.parquet_sorted)
         tree = None  # CompactTree not needed when benchmarking PyArrow
     else:
         if args.mode in ("build", "both"):
@@ -686,18 +820,22 @@ if __name__ == "__main__":
             use_parquet=args.use_parquet,
             parquet_sorted=args.parquet_sorted,
             parquet_table=parquet_table,
+            use_parquet_map=args.use_parquet_map,
+            parquet_map_table=parquet_map_table,
         )
 
     # ------------------------------------------------------------------
     # Serde phases (CompactTree only)
     # ------------------------------------------------------------------
     if args.mode in ("serialize", "serde"):
+        assert tree is not None
         tmp = profile_serialize(tree)
         if args.mode == "serde":
             profile_deserialize(tmp)
         os.unlink(tmp)
 
     if args.mode == "deserialize":
+        assert tree is not None
         with tempfile.NamedTemporaryFile(suffix=".ctree", delete=False) as _f:
             tmp = _f.name
         print("\nSerializing once (unprofiled) to temp file...")
