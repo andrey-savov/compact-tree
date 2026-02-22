@@ -5,7 +5,9 @@ three PyArrow table layouts.
 
 ---
 
-## Platform
+## Platforms
+
+### Platform A — Windows 11
 
 | Field | Value |
 |---|---|
@@ -13,6 +15,16 @@ three PyArrow table layouts.
 | OS | Windows 11 (10.0.26200) |
 | CPU | Intel Core Ultra 9 285H |
 | Python | 3.14.3 (CPython, MSC v.1944 64-bit, AMD64) |
+| PyArrow | 23.0.1 |
+
+### Platform B — Linux (WSL2)
+
+| Field | Value |
+|---|---|
+| Date | 2026-02-22 |
+| OS | Linux (WSL2, kernel 6.6.87.2-microsoft-standard-WSL2) |
+| CPU | Intel Core Ultra 9 285H |
+| Python | 3.14.3 (CPython, GCC 13.3.0, 64-bit, x86_64) |
 | PyArrow | 23.0.1 |
 
 ---
@@ -43,6 +55,8 @@ three PyArrow table layouts.
 
 ## Results — lookup throughput
 
+### Platform A — Windows 11
+
 | Target | Lookups / s | µs / lookup | vs dict |
 |---|---|---|---|
 | `dict[k0][k1][k2]` | 235,958 | 4.2 | 1.0× (baseline) |
@@ -52,16 +66,31 @@ three PyArrow table layouts.
 | PyArrow nested map (`pc.map_lookup` × 3) | 64 | 15,734 | 0.00027× |
 | PyArrow flat table, filter scan | 34 | 29,302 | 0.00014× |
 
+### Platform B — Linux (WSL2)
+
+| Target | Lookups / s | µs / lookup | vs dict |
+|---|---|---|---|
+| `dict[k0][k1][k2]` | 256,157 | 3.9 | 1.0× (baseline) |
+| `CompactTree[k0][k1][k2]` (LRU cache, default) | 141,112 | 7.1 | 0.55× |
+| `CompactTree[k0][k1][k2]` (no LRU cache, `--vocab-size 0`) | 137,149 | 7.3 | 0.54× |
+| PyArrow flat table, sorted + bisect | 122,284 | 8.2 | 0.48× |
+| PyArrow nested map (`pc.map_lookup` × 3) | 72 | 13,981 | 0.00028× |
+| PyArrow flat table, filter scan | 42 | 23,917 | 0.00016× |
+
 ### Notes
 
 * **CompactTree vs sorted-bisect PyArrow** are within measurement noise of
-  each other (~8.4–8.8 µs). Both are roughly 2× slower than a native dict.
+  each other (~7.1–8.8 µs across platforms). Both are roughly 2× slower than
+  a native dict on both platforms.
+* **Linux vs Windows**: Linux (WSL2) shows ~20% higher throughput for dict and
+  CompactTree (~256K vs ~236K and ~141K vs ~117K lookups/s), consistent with
+  lower syscall/scheduler overhead in native Linux execution.
 * **LRU cache vs no cache**: with `--vocab-size 0` the per-instance
   `lru_cache` on `index()` is disabled and every call goes directly to
   `_index_uncached` (pure Python trie traversal or C extension lookup without
   the cache layer). At L2 = 173K, the default cache is sized to hold the full
   vocabulary (~173K keys) so the cache fill-ratio is near 100% after warmup —
-  yet the two variants measure within noise of each other (~8.4 vs 8.6 µs).
+  yet the two variants measure within noise of each other on both platforms.
   The LRU cache introduces its own hashing and bookkeeping overhead that
   largely cancels out the benefit of skipping the trie walk on a hit, making
   the cache neutral at this key-count and access pattern.
