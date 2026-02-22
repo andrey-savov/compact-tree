@@ -103,12 +103,12 @@ call made by `CompactTree.from_dict()`, keeping steady-state memory minimal.
 ### from_dict build pipeline
 
 ```
-from_dict(data, *, vocabulary_size=None)
+from_dict(data, *, vocabulary_size=0)
   |
   +-- _walk_dict()              collect all_keys (set) + unique_values (set)
   |
-  +-- key_cache_size  =  vocabulary_size  or  len(all_keys)
-  +-- val_cache_size  =  vocabulary_size  or  len(unique_values)
+  +-- key_cache_size  =  vocabulary_size   (0 = disabled [default]; None = len(all_keys))
+  +-- val_cache_size  =  vocabulary_size   (0 = disabled [default]; None = len(unique_values))
   |
   +-- MarisaTrie(all_keys, cache_size=key_cache_size)      build key trie
   |     _build_intermediate_trie() -> dict-of-dicts
@@ -143,9 +143,9 @@ Payload : keys_trie_bytes | val_trie_bytes | child_count_bytes
 
 `key_vocab_size` and `val_vocab_size` are the effective `lru_cache(maxsize=…)` values
 used for the key and value `MarisaTrie` instances respectively. They are set during
-`from_dict` (either from the caller-supplied `vocabulary_size` hint or computed
-automatically as `len(all_keys)` / `len(unique_values)`) and restored on every load
-so that query-time caches are immediately correctly sized.
+`from_dict` from the `vocabulary_size` argument (`0` = disabled, default; `None` =
+auto-sizes to `len(all_keys)` / `len(unique_values)`; positive int = explicit cap)
+and restored on every load so that query-time caches are immediately correctly sized.
 
 `keys_trie_bytes` and `val_trie_bytes` are serialised `MarisaTrie` instances (CSR
 format, v2). `child_count_bytes`, `vcol_bytes`, and `elbl_bytes` are packed uint32

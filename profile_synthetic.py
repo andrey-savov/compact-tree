@@ -18,7 +18,7 @@ Usage
   python profile_synthetic.py --mode deserialize # profile single deserialize
   python profile_synthetic.py --mode serde      # profile serialize then deserialize
   python profile_synthetic.py --l2 5000 --mode serde  # override L2 key count
-  python profile_synthetic.py --mode lookup --vocab-size 0  # disable LRU, profile _index_uncached
+  python profile_synthetic.py --mode lookup --vocab-size None  # enable auto-sized LRU cache
   python profile_synthetic.py --mode lookup --use-parquet          # PyArrow table filter-based lookup
   python profile_synthetic.py --mode lookup --use-parquet --parquet-sorted  # PyArrow sorted + bisect
   python profile_synthetic.py --mode build  --use-parquet          # profile PyArrow table construction
@@ -364,7 +364,7 @@ def profile_parquet_map_build(d: dict[str, dict[str, dict[str, str]]]) -> pa.Tab
 # Profiling
 # ---------------------------------------------------------------------------
 
-def profile_ingestion(d: dict[str, dict[str, dict[str, str]]], vocabulary_size: Optional[int] = None) -> CompactTree:
+def profile_ingestion(d: dict[str, dict[str, dict[str, str]]], vocabulary_size: Optional[int] = 0) -> CompactTree:
     """Profile CompactTree.from_dict(d) and print a summary."""
     # Estimate unique keys and values to size the LRU cache exactly.
     all_keys: set[str] = set()
@@ -378,11 +378,11 @@ def profile_ingestion(d: dict[str, dict[str, dict[str, str]]], vocabulary_size: 
                 all_values.add(str(v))
     _walk(d)
     vocab_hint = (
-        f"vocabulary_size={vocabulary_size} (cache DISABLED — every lookup calls _index_uncached)"
+        f"vocabulary_size={vocabulary_size} (cache DISABLED — every lookup calls _index_uncached, default)"
         if vocabulary_size == 0
-        else f"vocabulary_size={vocabulary_size!r} (auto-sized to vocab)"
-        if vocabulary_size is not None
-        else f"vocabulary_size=None (auto={len(all_keys) + len(all_values):,})"
+        else f"vocabulary_size=None (auto-sized to {len(all_keys) + len(all_values):,})"
+        if vocabulary_size is None
+        else f"vocabulary_size={vocabulary_size!r} (capped cache)"
     )
     print(f"  Unique keys: {len(all_keys):,}, unique values: {len(all_values):,} "
           f"-> {vocab_hint}")
@@ -757,14 +757,20 @@ if __name__ == "__main__":
             "use bisect for O(log N) lookups instead of a full-table filter scan."
         ),
     )
+    def _vocab_size_type(v: str) -> Optional[int]:
+        if v.lower() == "none":
+            return None
+        return int(v)
+
     parser.add_argument(
         "--vocab-size",
-        type=int,
-        default=None,
+        type=_vocab_size_type,
+        default=0,
         metavar="N",
         dest="vocab_size",
         help="vocabulary_size passed to from_dict (sets lru_cache maxsize). "
-             "Use 0 to disable the LRU cache entirely and profile _index_uncached directly.",
+             "0 (default) disables the LRU cache entirely. "
+             "Pass 'None' to auto-size the cache to the full vocabulary.",
     )
     args = parser.parse_args()
 

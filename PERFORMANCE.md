@@ -60,8 +60,8 @@ three PyArrow table layouts.
 | Target | Lookups / s | µs / lookup | vs dict |
 |---|---|---|---|
 | `dict[k0][k1][k2]` | 235,958 | 4.2 | 1.0× (baseline) |
-| `CompactTree[k0][k1][k2]` (LRU cache, default) | 116,589 | 8.6 | 0.49× |
-| `CompactTree[k0][k1][k2]` (no LRU cache, `--vocab-size 0`) | 119,100 | 8.4 | 0.50× |
+| `CompactTree[k0][k1][k2]` (no LRU cache, default) | 119,100 | 8.4 | 0.50× |
+| `CompactTree[k0][k1][k2]` (LRU cache, `vocabulary_size=None`) | 116,589 | 8.6 | 0.49× |
 | PyArrow flat table, sorted + bisect | 113,450 | 8.8 | 0.48× |
 | PyArrow nested map (`pc.map_lookup` × 3) | 64 | 15,734 | 0.00027× |
 | PyArrow flat table, filter scan | 34 | 29,302 | 0.00014× |
@@ -71,8 +71,8 @@ three PyArrow table layouts.
 | Target | Lookups / s | µs / lookup | vs dict |
 |---|---|---|---|
 | `dict[k0][k1][k2]` | 256,157 | 3.9 | 1.0× (baseline) |
-| `CompactTree[k0][k1][k2]` (LRU cache, default) | 141,112 | 7.1 | 0.55× |
-| `CompactTree[k0][k1][k2]` (no LRU cache, `--vocab-size 0`) | 137,149 | 7.3 | 0.54× |
+| `CompactTree[k0][k1][k2]` (no LRU cache, default) | 137,149 | 7.3 | 0.54× |
+| `CompactTree[k0][k1][k2]` (LRU cache, `vocabulary_size=None`) | 141,112 | 7.1 | 0.55× |
 | PyArrow flat table, sorted + bisect | 122,284 | 8.2 | 0.48× |
 | PyArrow nested map (`pc.map_lookup` × 3) | 72 | 13,981 | 0.00028× |
 | PyArrow flat table, filter scan | 42 | 23,917 | 0.00016× |
@@ -85,15 +85,14 @@ three PyArrow table layouts.
 * **Linux vs Windows**: Linux (WSL2) shows ~20% higher throughput for dict and
   CompactTree (~256K vs ~236K and ~141K vs ~117K lookups/s), consistent with
   lower syscall/scheduler overhead in native Linux execution.
-* **LRU cache vs no cache**: with `--vocab-size 0` the per-instance
-  `lru_cache` on `index()` is disabled and every call goes directly to
-  `_index_uncached` (pure Python trie traversal or C extension lookup without
-  the cache layer). At L2 = 173K, the default cache is sized to hold the full
-  vocabulary (~173K keys) so the cache fill-ratio is near 100% after warmup —
-  yet the two variants measure within noise of each other on both platforms.
-  The LRU cache introduces its own hashing and bookkeeping overhead that
-  largely cancels out the benefit of skipping the trie walk on a hit, making
-  the cache neutral at this key-count and access pattern.
+* **LRU cache vs no cache** (now default): with `vocabulary_size=0` (the
+  default) the per-instance `lru_cache` on `index()` is disabled and every
+  call goes directly to `_index_uncached` (pure Python trie traversal or C
+  extension lookup). Because the LRU cache introduces its own hashing and
+  bookkeeping overhead that largely cancels out the benefit of skipping the
+  trie walk on a hit, the two variants measure within noise of each other on
+  both platforms (~7–9 µs). The cache is therefore disabled by default; pass
+  `vocabulary_size=None` to `from_dict()` to re-enable auto-sized caching.
 * **PyArrow flat filter** and **nested map** are O(N) scans over all 173K rows
   per lookup — roughly 1,500–3,500× slower than the indexed approaches. They
   are included for completeness, not as practical lookup strategies.
@@ -121,8 +120,8 @@ loop). Representative wall times at L2 = 173,000:
 
 ```bash
 # Lookup benchmarks (5 s each)
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --vocab-size 0
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5                         # no LRU cache (default)
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --vocab-size None       # LRU cache, auto-sized
 python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --use-dict
 python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --use-parquet --parquet-sorted
 python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --use-parquet-map
