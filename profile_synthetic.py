@@ -19,6 +19,10 @@ Usage
   python profile_synthetic.py --mode serde      # profile serialize then deserialize
   python profile_synthetic.py --l2 5000 --mode serde  # override L2 key count
   python profile_synthetic.py --mode lookup --vocab-size 0  # disable LRU, profile _index_uncached
+  python profile_synthetic.py --mode lookup --use-parquet          # PyArrow table filter-based lookup
+  python profile_synthetic.py --mode lookup --use-parquet --parquet-sorted  # PyArrow sorted + bisect
+  python profile_synthetic.py --mode build  --use-parquet          # profile PyArrow table construction
+  python profile_synthetic.py --mode both   --use-parquet          # profile table build + lookup
 """
 
 import argparse
@@ -126,6 +130,134 @@ def build_dict(l2_keys: int = 173_000) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# PyArrow table helpers
+# ---------------------------------------------------------------------------
+
+def dict_to_arrow_table(d: dict, sorted_table: bool = False):
+    """Flatten the 3-level dict to a PyArrow table with 4 string columns.
+
+    Columns: ``l0_key``, ``l1_key``, ``l2_key``, ``value``.
+
+    When *sorted_table* is True, a combined ``_skey`` column
+    (``l0_key + '\\x00' + l1_key + '\\x00' + l2_key``) is appended and the
+    table is sorted by it ascending so that :func:`parquet_sorted_lookup` can
+    use :mod:`bisect` for O(log N) lookups.
+    """
+    import pyarrow as pa  # lazy import — only required when --use-parquet is active
+
+    l0_col: list[str] = []
+    l1_col: list[str] = []
+    l2_col: list[str] = []
+    val_col: list[str] = []
+
+    for k0, sub1 in d.items():
+        for k1, sub2 in sub1.items():
+            for k2, v in sub2.items():
+                l0_col.append(k0)
+                l1_col.append(k1)
+                l2_col.append(k2)
+                val_col.append(v)
+
+    schema = pa.schema([
+        ("l0_key", pa.string()),
+        ("l1_key", pa.string()),
+        ("l2_key", pa.string()),
+        ("value",  pa.string()),
+    ])
+    table = pa.table(
+        {
+            "l0_key": pa.array(l0_col, type=pa.string()),
+            "l1_key": pa.array(l1_col, type=pa.string()),
+            "l2_key": pa.array(l2_col, type=pa.string()),
+            "value":  pa.array(val_col, type=pa.string()),
+        },
+        schema=schema,
+    )
+
+    if sorted_table:
+        import pyarrow.compute as pc  # noqa: F401 — needed for sort_indices
+        skey_col = [
+            k0 + "\x00" + k1 + "\x00" + k2
+            for k0, k1, k2 in zip(l0_col, l1_col, l2_col)
+        ]
+        table = table.append_column(
+            "_skey", pa.array(skey_col, type=pa.string())
+        )
+        sort_idx = pa.compute.sort_indices(table, sort_keys=[("_skey", "ascending")])
+        table = table.take(sort_idx)
+
+    return table
+
+
+def parquet_filter_lookup(table, k0: str, k1: str, k2: str) -> str:
+    """Point lookup on an unsorted PyArrow table using ``pc.equal`` + ``table.filter``.
+
+    Raises :class:`KeyError` when no matching row is found.
+    """
+    import pyarrow.compute as pc
+
+    mask = pc.and_(
+        pc.and_(
+            pc.equal(table.column("l0_key"), k0),
+            pc.equal(table.column("l1_key"), k1),
+        ),
+        pc.equal(table.column("l2_key"), k2),
+    )
+    result = table.filter(mask)
+    if result.num_rows == 0:
+        raise KeyError((k0, k1, k2))
+    return result.column("value")[0].as_py()
+
+
+def parquet_sorted_lookup(
+    table,
+    skey_list: list[str],
+    k0: str,
+    k1: str,
+    k2: str,
+) -> str:
+    """O(log N) point lookup on a pre-sorted PyArrow table.
+
+    *skey_list* must be the ``_skey`` column materialised as a Python list
+    (call ``table.column("_skey").to_pylist()`` once before the benchmark loop
+    and reuse it).  :mod:`bisect` locates the row index; the value is then
+    fetched directly from the PyArrow ``value`` column.
+
+    Raises :class:`KeyError` when no matching row is found.
+    """
+    import bisect
+
+    target = k0 + "\x00" + k1 + "\x00" + k2
+    idx = bisect.bisect_left(skey_list, target)
+    if idx >= len(skey_list) or skey_list[idx] != target:
+        raise KeyError((k0, k1, k2))
+    return table.column("value")[idx].as_py()
+
+
+def profile_parquet_build(d: dict, parquet_sorted: bool = False):
+    """Profile :func:`dict_to_arrow_table` and print a cProfile summary.
+
+    Returns the built table so the caller can pass it directly to
+    :func:`profile_lookup` when running ``--mode both --use-parquet``.
+    """
+    mode_label = "sorted (_skey column + sort)" if parquet_sorted else "unsorted"
+    print(f"\nProfiling dict_to_arrow_table() [{mode_label}] ...")
+
+    profiler = cProfile.Profile()
+    wall_start = time.perf_counter()
+    profiler.enable()
+    table = dict_to_arrow_table(d, sorted_table=parquet_sorted)
+    profiler.disable()
+    wall_elapsed = time.perf_counter() - wall_start
+
+    print(f"  Wall time: {wall_elapsed:.3f}s")
+    print(f"  Rows: {table.num_rows:,}  |  Size: {table.nbytes / 1_048_576:.1f} MiB")
+
+    _print_profile_stats(profiler)
+    return table
+
+
+# ---------------------------------------------------------------------------
 # Profiling
 # ---------------------------------------------------------------------------
 
@@ -218,12 +350,18 @@ def _print_profile_stats(
 # Lookup profiling
 # ---------------------------------------------------------------------------
 
-def profile_lookup(tree: CompactTree, d: dict,
-                   duration: float = 10.0,
-                   miss_ratio: float = 0.1,
-                   use_get_path: bool = False,
-                   use_dict: bool = False) -> None:
-    """Profile random leaf lookups on *tree* (or *d*) for approximately *duration* seconds.
+def profile_lookup(
+    tree: Optional[CompactTree],
+    d: dict,
+    duration: float = 10.0,
+    miss_ratio: float = 0.1,
+    use_get_path: bool = False,
+    use_dict: bool = False,
+    use_parquet: bool = False,
+    parquet_sorted: bool = False,
+    parquet_table: Optional[object] = None,
+) -> None:
+    """Profile random leaf lookups for approximately *duration* seconds.
 
     Key generation is O(1) per lookup: precompute the small key lists for
     each level, then use ``rng.randrange(len(keys))`` + direct list indexing
@@ -232,8 +370,16 @@ def profile_lookup(tree: CompactTree, d: dict,
     ``miss_ratio`` fraction of lookups intentionally use a key from the wrong
     level (guaranteed miss) to exercise the KeyError / __contains__ path.
 
-    When *use_dict* is True the benchmark runs against the plain Python dict
-    *d* instead of the CompactTree, giving a direct baseline comparison.
+    Target selection (mutually exclusive):
+
+    * default — ``tree[k0][k1][k2]`` against the CompactTree
+    * ``use_get_path`` — ``tree.get_path(k0, k1, k2)``
+    * ``use_dict`` — ``d[k0][k1][k2]`` against the plain Python dict
+    * ``use_parquet`` — PyArrow table lookup (filter-based or sorted bisect)
+
+    When *use_parquet* is True and *parquet_table* is None the table is built
+    from *d* here (outside the timed loop).  Pass a pre-built table (e.g. from
+    :func:`profile_parquet_build`) to avoid building it twice in ``--mode both``.
     """
     # Extract key lists once — tiny: 9, 4, 173K entries.
     l0_keys = list(d.keys())
@@ -244,8 +390,26 @@ def profile_lookup(tree: CompactTree, d: dict,
     n0, n1, n2 = len(l0_keys), len(l1_keys), len(l2_keys)
     print(f"\nKey lists: L0={n0}, L1={n1}, L2={n2:,}")
 
-    # Warmup: prime lru_cache on all three key levels (skip if cache/dict mode).
-    if use_dict:
+    # ------------------------------------------------------------------
+    # Per-target setup and warmup
+    # ------------------------------------------------------------------
+    skey_list: Optional[list[str]] = None  # only used by parquet_sorted path
+
+    if use_parquet:
+        if parquet_table is None:
+            print("  Building PyArrow table from dict (unprofiled)...")
+            t0 = time.perf_counter()
+            parquet_table = dict_to_arrow_table(d, sorted_table=parquet_sorted)
+            print(f"  Table built in {time.perf_counter() - t0:.3f}s  "
+                  f"({parquet_table.num_rows:,} rows, "
+                  f"{parquet_table.nbytes / 1_048_576:.1f} MiB)")
+        if parquet_sorted:
+            print("  Extracting _skey list for bisect (one-time)...")
+            skey_list = parquet_table.column("_skey").to_pylist()
+            print("  Using PyArrow table (sorted, O(log N) bisect + column access)")
+        else:
+            print("  Using PyArrow table (filter: pc.equal + table.filter)")
+    elif use_dict:
         print("  Using plain Python dict — no warmup needed")
     else:
         cache_disabled = getattr(tree, '_key_vocab_size', None) == 0
@@ -253,7 +417,7 @@ def profile_lookup(tree: CompactTree, d: dict,
             print("  Cache disabled (vocab_size=0) — skipping warmup, profiling _index_uncached directly")
         else:
             for _ in range(2_000):
-                _ = tree[l0_keys[_ % n0]]
+                _ = tree[l0_keys[_ % n0]]  # type: ignore[index]
             print("  Warmed up")
 
     rng = random.Random(42)
@@ -274,21 +438,31 @@ def profile_lookup(tree: CompactTree, d: dict,
                 # Guaranteed miss: swap k2 for a key from the wrong level.
                 k2 = l0_keys[rng.randrange(n0)]
                 try:
-                    if use_dict:
+                    if use_parquet:
+                        if parquet_sorted:
+                            _ = parquet_sorted_lookup(parquet_table, skey_list, k0, k1, k2)
+                        else:
+                            _ = parquet_filter_lookup(parquet_table, k0, k1, k2)
+                    elif use_dict:
                         _ = d[k0][k1][k2]
                     elif use_get_path:
-                        _ = tree.get_path(k0, k1, k2)
+                        _ = tree.get_path(k0, k1, k2)  # type: ignore[union-attr]
                     else:
-                        _ = tree[k0][k1][k2]
+                        _ = tree[k0][k1][k2]  # type: ignore[index]
                 except KeyError:
                     pass
             else:
-                if use_dict:
+                if use_parquet:
+                    if parquet_sorted:
+                        _ = parquet_sorted_lookup(parquet_table, skey_list, k0, k1, k2)
+                    else:
+                        _ = parquet_filter_lookup(parquet_table, k0, k1, k2)
+                elif use_dict:
                     _ = d[k0][k1][k2]
                 elif use_get_path:
-                    _ = tree.get_path(k0, k1, k2)
+                    _ = tree.get_path(k0, k1, k2)  # type: ignore[union-attr]
                 else:
-                    _ = tree[k0][k1][k2]
+                    _ = tree[k0][k1][k2]  # type: ignore[index]
         n_iters += CHECK_INTERVAL
         if time.perf_counter() - wall_start >= duration:
             break
@@ -413,12 +587,38 @@ if __name__ == "__main__":
         dest="use_get_path",
         help="Use tree.get_path(k0,k1,k2) instead of tree[k0][k1][k2] in the lookup benchmark",
     )
-    parser.add_argument(
+
+    # --use-dict and --use-parquet are mutually exclusive lookup-target overrides.
+    target_group = parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--use-dict",
         action="store_true",
         default=False,
         dest="use_dict",
         help="Benchmark the plain Python dict instead of CompactTree (baseline comparison)",
+    )
+    target_group.add_argument(
+        "--use-parquet",
+        action="store_true",
+        default=False,
+        dest="use_parquet",
+        help=(
+            "Benchmark a PyArrow table instead of CompactTree. "
+            "Supported with --mode build, lookup, and both. "
+            "Uses filter-based lookup (pc.equal + table.filter) by default; "
+            "add --parquet-sorted for O(log N) bisect on a pre-sorted table."
+        ),
+    )
+
+    parser.add_argument(
+        "--parquet-sorted",
+        action="store_true",
+        default=False,
+        dest="parquet_sorted",
+        help=(
+            "With --use-parquet: sort the table by (l0_key, l1_key, l2_key) and "
+            "use bisect for O(log N) lookups instead of a full-table filter scan."
+        ),
     )
     parser.add_argument(
         "--vocab-size",
@@ -431,6 +631,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # Post-parse validation
+    if args.parquet_sorted and not args.use_parquet:
+        parser.error("--parquet-sorted requires --use-parquet")
+    if args.use_parquet and args.mode in ("serialize", "deserialize", "serde"):
+        parser.error("--use-parquet is not supported with serde modes (serialize/deserialize/serde)")
+
     # Resolve L2 size: explicit > mode default > global default
     if args.l2 is not None:
         l2_size = args.l2
@@ -441,20 +647,50 @@ if __name__ == "__main__":
 
     d = build_dict(l2_keys=l2_size)
 
-    if args.mode in ("build", "both"):
-        tree = profile_ingestion(d, vocabulary_size=args.vocab_size)
+    # ------------------------------------------------------------------
+    # Build phase
+    # ------------------------------------------------------------------
+    parquet_table: Optional[object] = None  # set when --use-parquet is active
+
+    if args.use_parquet:
+        if args.mode in ("build", "both"):
+            parquet_table = profile_parquet_build(d, parquet_sorted=args.parquet_sorted)
+        else:
+            # lookup mode: build silently, will be passed into profile_lookup
+            print("\nBuilding PyArrow table (unprofiled)...")
+            t0 = time.perf_counter()
+            parquet_table = dict_to_arrow_table(d, sorted_table=args.parquet_sorted)
+            print(f"  Table built in {time.perf_counter() - t0:.3f}s  "
+                  f"({parquet_table.num_rows:,} rows, "
+                  f"{parquet_table.nbytes / 1_048_576:.1f} MiB)")
+        tree = None  # CompactTree not needed when benchmarking PyArrow
     else:
-        # Build silently for all other modes.
-        print("\nBuilding CompactTree (unprofiled)...")
-        t0 = time.perf_counter()
-        tree = CompactTree.from_dict(d, vocabulary_size=args.vocab_size)
-        print(f"  Built in {time.perf_counter() - t0:.3f}s")
+        if args.mode in ("build", "both"):
+            tree = profile_ingestion(d, vocabulary_size=args.vocab_size)
+        else:
+            # Build silently for all other modes.
+            print("\nBuilding CompactTree (unprofiled)...")
+            t0 = time.perf_counter()
+            tree = CompactTree.from_dict(d, vocabulary_size=args.vocab_size)
+            print(f"  Built in {time.perf_counter() - t0:.3f}s")
 
+    # ------------------------------------------------------------------
+    # Lookup phase
+    # ------------------------------------------------------------------
     if args.mode in ("lookup", "both"):
-        profile_lookup(tree, d, duration=args.lookup_duration,
-                       use_get_path=args.use_get_path,
-                       use_dict=args.use_dict)
+        profile_lookup(
+            tree, d,
+            duration=args.lookup_duration,
+            use_get_path=args.use_get_path,
+            use_dict=args.use_dict,
+            use_parquet=args.use_parquet,
+            parquet_sorted=args.parquet_sorted,
+            parquet_table=parquet_table,
+        )
 
+    # ------------------------------------------------------------------
+    # Serde phases (CompactTree only)
+    # ------------------------------------------------------------------
     if args.mode in ("serialize", "serde"):
         tmp = profile_serialize(tree)
         if args.mode == "serde":
@@ -468,3 +704,4 @@ if __name__ == "__main__":
         tree.serialize(tmp)
         profile_deserialize(tmp)
         os.unlink(tmp)
+
