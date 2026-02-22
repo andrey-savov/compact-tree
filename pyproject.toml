@@ -82,7 +82,7 @@ test-command = "pytest {project}/test_compact_tree.py {project}/test_marisa_trie
 
 [tool.cibuildwheel.macos]
 # archs are set per-runner via CIBW_ARCHS_MACOS in the workflow matrix
-# (macos-13 → x86_64, macos-latest/arm64 → arm64)
+# (two parallel jobs: arm64 and x86_64)
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
