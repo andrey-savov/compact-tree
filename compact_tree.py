@@ -127,6 +127,12 @@ class CompactTree:
                 (zero evictions), or a positive int to cap memory use at the
                 cost of occasional re-traversals.
         """
+        if vocabulary_size is not None and vocabulary_size < 0:
+            raise ValueError(
+                f"vocabulary_size must be 0 (disable cache), None (auto-size), "
+                f"or a positive integer; got {vocabulary_size!r}"
+            )
+
         # 1. Collect vocabulary and leaf values
         all_keys: set[str] = set()
         unique_values: set[str] = set()

@@ -380,7 +380,10 @@ def profile_ingestion(d: dict[str, dict[str, dict[str, str]]], vocabulary_size: 
     vocab_hint = (
         f"vocabulary_size={vocabulary_size} (cache DISABLED — every lookup calls _index_uncached, default)"
         if vocabulary_size == 0
-        else f"vocabulary_size=None (auto-sized to {len(all_keys) + len(all_values):,})"
+        else (
+            "vocabulary_size=None (auto-sized per trie: "
+            f"keys={len(all_keys):,}, values={len(all_values):,})"
+        )
         if vocabulary_size is None
         else f"vocabulary_size={vocabulary_size!r} (capped cache)"
     )
@@ -740,9 +743,10 @@ if __name__ == "__main__":
         default=False,
         dest="use_parquet_map",
         help=(
-            "Benchmark a compact PyArrow table with a nested map column "
-            "(map<string, map<string, string>>). "
-            "Lookup uses pc.map_lookup (C++) + Python dict for the final level. "
+            "Benchmark a compact PyArrow table with a triply nested map column "
+            "(map<string, map<string, map<string, string>>>). "
+            "Lookup uses pc.map_lookup + pc.list_flatten at all three levels "
+            "(no Python-dict lookup). "
             "Supported with --mode build, lookup, and both."
         ),
     )
@@ -760,7 +764,17 @@ if __name__ == "__main__":
     def _vocab_size_type(v: str) -> Optional[int]:
         if v.lower() == "none":
             return None
-        return int(v)
+        try:
+            value = int(v)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "vocab-size must be an integer >= 0 or 'None'"
+            ) from exc
+        if value < 0:
+            raise argparse.ArgumentTypeError(
+                "vocab-size must be 0, a positive integer, or 'None'"
+            )
+        return value
 
     parser.add_argument(
         "--vocab-size",
@@ -781,6 +795,10 @@ if __name__ == "__main__":
         parser.error("--use-parquet is not supported with serde modes (serialize/deserialize/serde)")
     if args.use_parquet_map and args.mode in ("serialize", "deserialize", "serde"):
         parser.error("--use-parquet-map is not supported with serde modes (serialize/deserialize/serde)")
+    if args.use_get_path and args.use_dict:
+        parser.error("--use-get-path cannot be combined with --use-dict; get_path is only supported for CompactTree lookups")
+    if args.use_get_path and (args.use_parquet or args.use_parquet_map):
+        parser.error("--use-get-path is only supported when benchmarking CompactTree (not with --use-parquet or --use-parquet-map)")
 
     # Resolve L2 size: explicit > mode default > global default
     if args.l2 is not None:
@@ -799,10 +817,24 @@ if __name__ == "__main__":
     parquet_map_table: Optional[pa.Table] = None   # set when --use-parquet-map is active
 
     if args.use_parquet_map:
-        parquet_map_table = profile_parquet_map_build(d)
+        if args.mode in ("build", "both"):
+            parquet_map_table = profile_parquet_map_build(d)
+        else:
+            # Build PyArrow map table silently for lookup/other modes.
+            print("\nBuilding PyArrow map table (unprofiled)...")
+            t0 = time.perf_counter()
+            parquet_map_table = dict_to_arrow_map_table(d)
+            print(f"  Built in {time.perf_counter() - t0:.3f}s")
         tree = None  # CompactTree not needed when benchmarking PyArrow map
     elif args.use_parquet:
-        parquet_table = profile_parquet_build(d, parquet_sorted=args.parquet_sorted)
+        if args.mode in ("build", "both"):
+            parquet_table = profile_parquet_build(d, parquet_sorted=args.parquet_sorted)
+        else:
+            # Build PyArrow table silently for lookup/other modes.
+            print("\nBuilding PyArrow table (unprofiled)...")
+            t0 = time.perf_counter()
+            parquet_table = dict_to_arrow_table(d, sorted_table=args.parquet_sorted)
+            print(f"  Built in {time.perf_counter() - t0:.3f}s")
         tree = None  # CompactTree not needed when benchmarking PyArrow
     else:
         if args.mode in ("build", "both"):
