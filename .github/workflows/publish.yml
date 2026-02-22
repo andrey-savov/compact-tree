@@ -68,14 +68,11 @@ jobs:
     - name: Set up uv
       uses: astral-sh/setup-uv@v5
 
-    - name: Install build dependencies
-      run: uv pip install --system build twine
-
     - name: Build sdist
-      run: uv run python -m build --sdist
+      run: uv run --with build python -m build --sdist
 
     - name: Check sdist
-      run: twine check dist/*
+      run: uvx twine check dist/*
 
     - name: Upload sdist artifact
       uses: actions/upload-artifact@v4
@@ -106,9 +103,7 @@ jobs:
       uses: astral-sh/setup-uv@v5
 
     - name: Check distributions
-      run: |
-        uv pip install --system twine
-        twine check dist/*
+      run: uvx twine check dist/*
 
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
@@ -138,9 +133,7 @@ jobs:
       uses: astral-sh/setup-uv@v5
 
     - name: Check distributions
-      run: |
-        uv pip install --system twine
-        twine check dist/*
+      run: uvx twine check dist/*
 
     - name: Publish to Test PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
