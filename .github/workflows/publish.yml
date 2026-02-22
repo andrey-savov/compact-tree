@@ -22,18 +22,33 @@ jobs:
             artifact-name: linux-x86_64
             cibw-archs: x86_64
           - os: ubuntu-latest
-            artifact-name: linux-aarch64
+            artifact-name: linux-aarch64-cp39
             cibw-archs: aarch64
+            cibw-build: cp39-*
+          - os: ubuntu-latest
+            artifact-name: linux-aarch64-cp310
+            cibw-archs: aarch64
+            cibw-build: cp310-*
+          - os: ubuntu-latest
+            artifact-name: linux-aarch64-cp311
+            cibw-archs: aarch64
+            cibw-build: cp311-*
+          - os: ubuntu-latest
+            artifact-name: linux-aarch64-cp312
+            cibw-archs: aarch64
+            cibw-build: cp312-*
+          - os: ubuntu-latest
+            artifact-name: linux-aarch64-cp313
+            cibw-archs: aarch64
+            cibw-build: cp313-*
           - os: windows-latest
             artifact-name: windows
           - os: macos-latest
             artifact-name: macos-arm64
             cibw-archs: arm64
-            cibw-skip: cp39-macosx_arm64
           - os: macos-latest
             artifact-name: macos-x86_64
             cibw-archs: x86_64
-            cibw-skip: cp39-macosx_x86_64
 
     steps:
     - uses: actions/checkout@v4
@@ -51,6 +66,7 @@ jobs:
       uses: pypa/cibuildwheel@v2.21.3
       env:
         CIBW_BUILD_FRONTEND: "build[uv]"
+        CIBW_BUILD: ${{ matrix.cibw-build }}
         CIBW_ARCHS_LINUX: ${{ matrix.cibw-archs }}
         CIBW_ARCHS_MACOS: ${{ matrix.cibw-archs }}
         CIBW_SKIP: ${{ matrix.cibw-skip }}

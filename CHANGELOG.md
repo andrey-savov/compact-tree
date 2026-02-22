@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-02-21
+
+### Fixed
+
+- CI: switched to `cibuildwheel` for wheel builds so Linux wheels receive
+  a `manylinux` platform tag accepted by PyPI (previously uploaded wheels
+  were tagged `linux_x86_64` and rejected with HTTP 400).
+- CI: add QEMU emulation (`docker/setup-qemu-action`) for Linux aarch64 builds.
+- CI: cap `setuptools<77` and use `license = {text = "MIT"}` table form to
+  stay compatible with older setuptools on runner environments.
+- CI: add `uvx twine check dist/*` validation before every PyPI upload.
+
+### Performance
+
+- CI: wheel builds now run as 9 parallel jobs — linux-x86_64, five
+  per-Python-version linux-aarch64 jobs (cp39–cp313), windows, macos-arm64,
+  and macos-x86_64 — using `CIBW_BUILD_FRONTEND=build[uv]` for faster
+  dependency installs inside each build environment.
+
 ## [2.1.0] - 2026-02-21
 
 ### Added
@@ -188,7 +207,8 @@ Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entr
 - succinct >= 0.0.7
 - fsspec >= 2021.0.0
 
-[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/andrey-savov/compact-tree/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/andrey-savov/compact-tree/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/andrey-savov/compact-tree/compare/v1.2.1...v2.0.0
 [1.2.1]: https://github.com/andrey-savov/compact-tree/compare/v1.2.0...v1.2.1

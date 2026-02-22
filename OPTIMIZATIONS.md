@@ -17,6 +17,7 @@ This document tracks all performance optimizations made to the `compact_tree` an
   - [Combined Impact v1.2.0](#combined-impact-v120)
   - [Optimization #9: LOUDS Removal — CSR Binary Format](#optimization-9-louds-removal--csr-binary-format)
   - [Combined Impact v2.0.0](#combined-impact-v200)
+  - [Optimization #10: Packed uint64 Arrays in TrieIndex](#optimization-10-packed-uint64-arrays-in-trieindex)
 - [Potential Future Optimizations](#potential-future-optimizations)
 - [Measurement Tools](#measurement-tools)
 - [Optimization Guidelines](#optimization-guidelines)
@@ -408,6 +409,73 @@ Replace the LOUDS bit-vector child encoding in both `MarisaTrie` (format v2) and
 
 ---
 
+### Optimization #10: Packed uint64 Arrays in TrieIndex
+
+**Date:** 2026-02-21  
+**Component:** `_marisa_ext.c` (TrieIndex)
+
+**Problem:**  
+`TrieIndex_lookup` traversed up to 3 pairs of dependent 32-bit loads per trie node: `label_off`/`label_len` (sequential → dependent), `ch_start`/`ch_cnt` (always used together), and `ch_node_id`/`ch_pfx_count` (post-bisect pair). A separate `is_terminal` bool array required an additional load plus a conditional branch. Small inner nodes (L0=9 children, L1=4 children in the benchmark) used binary search despite having far fewer elements than the break-even point.
+
+**Solution:**  
+Pack each load pair into a single `uint64_t` array and fold `is_terminal` into bit 31 of the count field:
+
+```c
+// node_label[v] = label_off | (uint64_t)label_len << 32
+const uint64_t nlbl = node_label[child];
+uint32_t loff = (uint32_t)nlbl;
+uint32_t llen = (uint32_t)(nlbl >> 32);
+
+// node_csr[v] = ch_start | (uint64_t)(ch_cnt | is_terminal<<31) << 32
+// is_terminal[v] encoded in bit 31 of the high word — zero cost to check
+const uint64_t csr   = node_csr[parent];
+uint32_t start       = (uint32_t)csr;
+uint32_t cnt_t       = (uint32_t)(csr >> 32);   // cnt | (terminal<<31)
+uint32_t count       = cnt_t & 0x7FFFFFFFu;
+
+// MPH index accumulation: terminal of visited parent is now free
+idx += cnt_t >> 31;   // replaces is_terminal[parent] array load
+
+// child_desc[flat] = ch_node_id | (uint64_t)ch_pfx_count << 32
+const uint64_t desc  = child_desc[flat];
+uint32_t child       = (uint32_t)desc;
+uint32_t pfx_cnt     = (uint32_t)(desc >> 32);
+```
+
+Linear scan replaces binary search when `count ≤ 16` (threshold `TRIE_LINEAR_THRESHOLD`), covering both L0 (9 children) and L1 (4 children):
+
+```c
+if (count <= 16) {
+    const uint8_t *fb = ch_first_byte + start;
+    lo = 0;
+    while (lo < count && fb[lo] != first_byte) lo++;
+    if (lo >= count) { /* KeyError */ }
+} else {
+    /* binary search unchanged */
+}
+```
+
+Memory layout uses a single `malloc` with all `uint64_t` arrays at the base (naturally 8-byte aligned) and byte arrays appended after, eliminating any alignment padding.
+
+**Results (L2=10,000 benchmark, no LRU cache, `--vocab-size 0`):**
+
+| API | Before | After | Delta |
+|---|---|---|---|
+| `tree.get_path(k0,k1,k2)` | 207K / 4.83 µs | 211K / 4.74 µs | +2.1% |
+| `tree[k0][k1][k2]` | 155K / 6.45 µs | 159K / 6.31 µs | +2.4% |
+
+**Lessons learned:**  
+The ~2% gain confirmed that the packed-load / folded-terminal approach is correct but the remaining gap to a plain Python `dict[k0][k1][k2]` (~267K/s, 3.7 µs) is **not** in C-side integer arithmetic. `TreeIndex.get_path` self-time is ~1.68 µs; the remaining ~0.8 µs deficit is Python call overhead (argument tuple construction, `PyArg_ParseTuple`, `PyObject` returns). Further single-lookup gains require reducing Python ↔ C boundary crossings — either a batch/vectorised lookup API or a tighter wrapper that avoids tuple allocation.
+
+**Changes:**
+
+- File: `_marisa_ext.c`
+- `TrieIndexObject` struct: 9 separate pointer fields → 5 packed arrays (`node_label`, `node_csr`, `child_desc`, `ch_first_byte`, `label_bytes`)
+- `TrieIndex_init`: packs all arrays during construction; single `malloc`
+- `TrieIndex_lookup`: 3 packed 8-byte loads per iteration; `is_terminal` eliminated; linear scan for count ≤ 16
+
+---
+
 ## Potential Future Optimizations
 
 ### 1. Batch BFS Buffer Writes
@@ -423,6 +491,16 @@ Pre-allocate `vcol_buf` and `elbl_buf` as `array.array('I', [0] * total_nodes)` 
 Compile `_emit_children` and `_walk_dict` with Cython. At 6.2M leaves, Python dispatch overhead dominates these loops.
 
 **Estimated impact:** 3–5× speedup on `_emit_children`, bringing 173K real time from ~10s to ~3–4s.
+
+### 3. Batch / Vectorised Lookup API for TrieIndex
+
+**Motivation (verified by Opt #10):**  
+After packing all hot C-side loads, profiling showed `TreeIndex.get_path` C self-time ≈ 1.68 µs vs plain `dict[k0][k1][k2]` ≈ 3.7 µs total. The remaining ~0.8 µs deficit is entirely Python ↔ C boundary overhead (argument tuple construction, `PyArg_ParseTuple`, `PyObject` boxing). Single-call API improvements are saturated.
+
+**Idea:**  
+Add a `TrieIndex.lookup_batch(keys, out_buf)` C method that accepts a Python `list` or `memoryview` of key strings and writes integer results into a pre-allocated buffer with a single Python call, amortising all per-call overhead over N lookups.
+
+**Estimated impact:** Near-elimination of the Python call overhead for batch workloads; single-item latency unchanged.
 
 ---
 
