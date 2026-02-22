@@ -127,11 +127,20 @@ class CompactTree:
                 (zero evictions), or a positive int to cap memory use at the
                 cost of occasional re-traversals.
         """
-        if vocabulary_size is not None and vocabulary_size < 0:
-            raise ValueError(
-                f"vocabulary_size must be 0 (disable cache), None (auto-size), "
-                f"or a positive integer; got {vocabulary_size!r}"
-            )
+        if vocabulary_size is not None:
+            # Validate type explicitly to provide a clear error for invalid inputs
+            # (e.g., strings) before doing any numeric comparison.
+            if isinstance(vocabulary_size, bool) or not isinstance(vocabulary_size, int):
+                raise TypeError(
+                    "vocabulary_size must be an int (or None) specifying the "
+                    "LRU cache capacity; got "
+                    f"{type(vocabulary_size).__name__}: {vocabulary_size!r}"
+                )
+            if vocabulary_size < 0:
+                raise ValueError(
+                    f"vocabulary_size must be 0 (disable cache), None (auto-size), "
+                    f"or a positive integer; got {vocabulary_size!r}"
+                )
 
         # 1. Collect vocabulary and leaf values
         all_keys: set[str] = set()
