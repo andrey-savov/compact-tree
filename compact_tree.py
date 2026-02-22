@@ -113,20 +113,35 @@ class CompactTree:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *,
-                  vocabulary_size: Optional[int] = None) -> "CompactTree":
+                  vocabulary_size: Optional[int] = 0) -> "CompactTree":
         """Build a *CompactTree* entirely in memory from a nested Python dict.
 
         Keys must be strings.  Leaf values are stored as strings (non-string
         values are converted via ``str()``).
 
         Args:
-            vocabulary_size: Optional hint for the total number of unique words
-                in the source dict (keys + values combined).  Used to size the
-                LRU cache on each ``MarisaTrie`` so that all vocabulary entries
-                fit in cache with zero evictions.  When ``None`` (default) the
-                actual vocabulary sizes are computed automatically from the data
-                and used as the cache size for each trie independently.
+            vocabulary_size: Controls the ``lru_cache`` capacity on each
+                ``MarisaTrie``.  ``0`` (default) disables the LRU cache
+                entirely — every lookup goes directly to the trie traversal.
+                Pass ``None`` to auto-size the cache to the full vocabulary
+                (zero evictions), or a positive int to cap memory use at the
+                cost of occasional re-traversals.
         """
+        if vocabulary_size is not None:
+            # Validate type explicitly to provide a clear error for invalid inputs
+            # (e.g., strings) before doing any numeric comparison.
+            if isinstance(vocabulary_size, bool) or not isinstance(vocabulary_size, int):
+                raise TypeError(
+                    "vocabulary_size must be an int (or None) specifying the "
+                    "LRU cache capacity; got "
+                    f"{type(vocabulary_size).__name__}: {vocabulary_size!r}"
+                )
+            if vocabulary_size < 0:
+                raise ValueError(
+                    f"vocabulary_size must be 0 (disable cache), None (auto-size), "
+                    f"or a positive integer; got {vocabulary_size!r}"
+                )
+
         # 1. Collect vocabulary and leaf values
         all_keys: set[str] = set()
         unique_values: set[str] = set()
