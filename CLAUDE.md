@@ -17,8 +17,9 @@ with subtree word counts for minimal perfect hashing (MPH). It provides:
   `[0, N)`.
 - **Reverse lookup**: `restore_key(idx)` recovers the word from its index.
 - **C-level LRU-cached lookups**: per-instance `functools.lru_cache` wrapping
-  `_index_uncached` is installed as an instance attribute at construction and
-  deserialization time, giving near-zero overhead on cache hits.
+  `_c_index.lookup` (when the C extension is available) or `_index_uncached`
+  (pure-Python fallback) is installed as an instance attribute at construction
+  and deserialization time, giving near-zero overhead on cache hits.
 - **Bulk enumeration**: `to_dict()` returns `{word: index}` for every word in
   O(N). On the first call after construction it returns a pre-built mapping
   from the intermediate trie data and frees it immediately; subsequent calls or
@@ -72,8 +73,8 @@ CompactTree
 `_c_tree` is a `TreeIndex` (from `_marisa_ext`) built by `_attach_c_tree()` after
 construction, deserialization, and unpickling. It holds references to the packed
 byte buffers of `elbl`, `vcol`, `_child_start`, `_child_count`, and the key
-trie's `_c_index` (`TrieIndex`). When present, `__getitem__`, `__contains__`,
-and `get_path()` at both root and `_Node` level delegate entirely to C.
+trie's `_c_index` (`TrieIndex`). When present, `__getitem__` and `__contains__` at both root and `_Node` level,
+and `get_path()` at root level, delegate entirely to C.
 
 Each non-root node `v` (0-indexed) occupies a slot in both `elbl`
 (its edge label / key id) and `vcol` (its value id or the sentinel
@@ -92,7 +93,8 @@ During `MarisaTrie.__init__` two sets of structures coexist briefly:
 | `_node_labels`, `_node_children`, `_node_counts`, `_node_terminal`, `_root_children` | CSR trie for query-time navigation and serialization | permanent (run time + serialization) |
 | `_node_label_lens`, `_first_char_maps`, `_prefix_counts` | navigation tables for O(1) child dispatch and MPH accumulation in C index build | permanent (run time) |
 | `_c_index` (`TrieIndex`) | C-level trie lookup helper; set by `_build_c_index()` | permanent (run time, if extension built) |
-| `index` (lru_cache) | per-instance C-level cache wrapping `_index_uncached` | permanent (run time) |
+| `index` (lru_cache) | per-instance cache wrapping `_c_index.lookup` or `_index_uncached` | permanent (run time) |
+| `restore_key` (lru_cache) | per-instance cache wrapping `_restore_key_uncached` | permanent (run time) |
 
 The separation ensures that `_word_to_idx` (a full vocabulary dict, potentially
 hundreds of thousands of entries) does not persist beyond the single `to_dict()`
@@ -103,7 +105,7 @@ call made by `CompactTree.from_dict()`, keeping steady-state memory minimal.
 ```
 from_dict(data, *, vocabulary_size=None)
   |
-  +-- _walk_dict()              collect all_keys (set) + all_values (list)
+  +-- _walk_dict()              collect all_keys (set) + unique_values (set)
   |
   +-- key_cache_size  =  vocabulary_size  or  len(all_keys)
   +-- val_cache_size  =  vocabulary_size  or  len(unique_values)
@@ -192,3 +194,7 @@ tree.get_path("a", "x")   # equivalent to tree["a"]["x"]
 
 - `bitarray` -- bit-packed boolean arrays (terminal flags in MarisaTrie serialization)
 - `fsspec` -- filesystem abstraction for local and remote storage
+
+## See also
+
+- [OPTIMIZATIONS.md](OPTIMIZATIONS.md) -- full optimization history, benchmark results, potential future optimizations, and guidelines for profiling new changes.
