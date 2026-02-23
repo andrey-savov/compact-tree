@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "savov-compact-tree"
-version = "2.1.1"
+version = "3.0.0"
 description = "Compact, read-only nested dictionary backed by a DAWG-style radix trie"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -47,7 +47,7 @@ Repository = "https://github.com/andrey-savov/compact-tree"
 Issues = "https://github.com/andrey-savov/compact-tree/issues"
 
 [tool.setuptools]
-py-modules = ["compact_tree", "marisa_trie"]
+py-modules = ["compact_tree", "compact_tree_flat", "marisa_trie"]
 
 [tool.pytest.ini_options]
 testpaths = ["test_compact_tree.py", "test_marisa_trie.py"]

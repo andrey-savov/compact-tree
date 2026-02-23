@@ -10,9 +10,11 @@ Compact, read-only nested dictionary backed by a DAWG-style radix trie.
 ## Features
 
 - **Memory-efficient**: DAWG-style deduplication via two `MarisaTrie` instances (one for keys, one for values)
+- **Flat variant**: `CompactTreeFlat` stores all leaf paths as flat `tuple[str, …] → val_id` mappings — no intermediate nodes, `get_path()` only, ~38% faster than `CompactTree.get_path()` for full-path lookups
 - **Fast lookups**: Plain list-indexing over parallel arrays — no rank/select overhead
 - **C-accelerated lookups**: Optional `_marisa_ext` C extension provides `TrieIndex` and `TreeIndex` for ~5–10× faster uncached queries
 - **Multi-level traversal**: `get_path(*keys)` descends multiple levels in a single C call, eliminating intermediate `_Node` allocations
+- **Shared trie**: `shared_trie=True` uses a single `MarisaTrie` for both keys and values, saving memory when the vocabularies overlap
 - **High-performance builds**: 7.3s for a 6.2M-leaf, 173K-key tree (v2.0.0)
 - **Fast serialization**: 14/s at 173K keys, 77 MiB files
 - **Serializable**: Save and load from disk with efficient binary format
@@ -68,8 +70,11 @@ tree.serialize("tree.ctree")
 loaded_tree = CompactTree("tree.ctree")
 
 # Serialize with gzip compression
-tree.serialize("tree.ctree.gz", storage_options={"compression": "gzip"})
-loaded_gz = CompactTree("tree.ctree.gz", storage_options={"compression": "gzip"})
+tree.serialize("tree.ctree.gz", compression="gzip")
+loaded_gz = CompactTree("tree.ctree.gz", compression="gzip")
+
+# Shared trie: keys and values share one MarisaTrie (saves memory when vocabularies overlap)
+tree_shared = CompactTree.from_dict({"a": "b", "b": "a"}, shared_trie=True)
 
 # Pickle support
 import pickle
@@ -81,6 +86,34 @@ plain_dict = loaded_tree.to_dict()
 
 # Multi-level lookup in a single C call (when C extension is compiled)
 result = tree.get_path("a", "x")   # equivalent to tree["a"]["x"] but faster
+```
+
+### CompactTreeFlat — flat full-path lookup
+
+When you always know the full path depth at lookup time and don't need intermediate
+navigation, use `CompactTreeFlat` for ~38% faster `get_path()` calls:
+
+```python
+from compact_tree_flat import CompactTreeFlat
+
+d = {"a": {"x": "1"}, "b": {"x": "2", "y": "3"}}
+tree = CompactTreeFlat.from_dict(d)
+
+tree.get_path("a", "x")          # "1" — single dict lookup + restore_key, no trie traversal
+tree.get_path("b", "y")          # "3"
+("b", "x") in tree               # True — __contains__ takes a tuple
+len(tree)                         # 3  (total leaf paths)
+tree.to_dict()                   # {"a": {"x": "1"}, "b": {"x": "2", "y": "3"}}
+
+# Serialize / deserialize (CTFlt v1 binary format)
+tree.serialize("tree.ctflat")
+tree2 = CompactTreeFlat("tree.ctflat")
+
+tree.serialize("tree.ctflat.gz", compression="gzip")
+tree3 = CompactTreeFlat("tree.ctflat.gz", compression="gzip")
+
+import pickle
+tree4 = pickle.loads(pickle.dumps(tree))
 ```
 
 ## How It Works
@@ -115,7 +148,16 @@ CompactTree
   +-- vcol         : array.array('I')  value column (uint32: value id or 0xFFFFFFFF for internal nodes)
   +-- _key_trie    : MarisaTrie        key vocabulary (word <-> dense index)
   +-- _val_trie    : MarisaTrie        value vocabulary (word <-> dense index)
+  +-- _shared_trie : bool              True when a single MarisaTrie covers keys and values
   +-- _c_tree      : TreeIndex | None  optional C-level traversal helper (None if extension not built)
+```
+
+```
+CompactTreeFlat
+  |
+  +-- _key_dict      : dict[tuple[str, ...], int]  full path → val_id
+  +-- _val_trie      : MarisaTrie                  value vocabulary
+  +-- _val_vocab_size: int                          lru_cache size hint
 ```
 
 `MarisaTrie` additionally exposes:
@@ -126,20 +168,33 @@ Each non-root node `v` (0-indexed) occupies a slot in both `elbl` (its edge labe
 
 Child navigation uses CSR (Compressed Sparse Row) arrays: `_child_start[v]` is the start offset and `_child_count[v]` is the count of children of node `v`.
 
-## Binary Format (v5)
+## Binary Format
+
+### CompactTree — format v6
 
 ```
 Magic   : 5 bytes    "CTree"
-Version : 8 bytes    uint64 LE  (always 5)
-Header  : 7 × 8 bytes  lengths of: keys_trie, val_trie, child_count,
-                         vcol, elbl, key_vocab_size, val_vocab_size
-Payload : keys_trie_bytes | val_trie_bytes | child_count_bytes
-          | vcol_bytes | elbl_bytes
+Version : 8 bytes    uint64 LE  (always 6)
+Header  : 8 × 8 bytes  shared_flag, keys_trie_len, val_trie_len, child_count_len,
+                         vcol_len, elbl_len, key_vocab_size, val_vocab_size
+Payload : keys_trie_bytes | val_trie_bytes (empty when shared)
+          | child_count_bytes | vcol_bytes | elbl_bytes
 ```
 
-`keys_trie_bytes` and `val_trie_bytes` are serialized `MarisaTrie` instances (CSR format). `child_count_bytes`, `vcol_bytes`, and `elbl_bytes` are packed `uint32` arrays. `key_vocab_size` and `val_vocab_size` record the LRU cache sizes used during `from_dict` and are restored on load so query-time caches are immediately correctly sized.
+When `shared_flag=1` (built with `shared_trie=True`), `val_trie_len=0` and no
+value-trie blob is written; on load both `_key_trie` and `_val_trie` point to the
+same deserialized `MarisaTrie`.
 
-Files written in v4 or earlier (LOUDS-based) are **not** supported. Use v1.x to migrate old files if needed.
+Files written in v5 or earlier are **not** supported.
+
+### CompactTreeFlat — format CTFlt v1
+
+```
+Magic   : 5 bytes    "CTFlt"
+Version : 8 bytes    uint64 LE  (always 1)
+Header  : 4 × 8 bytes  n_paths, val_trie_len, paths_buf_len, val_vocab_size
+Payload : val_trie_bytes | paths_buf
+```
 
 ## Dependencies
 
@@ -165,15 +220,19 @@ See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for detailed results and [OPTIM
 ## Performance
 
 Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entries.
+Windows 11, Intel Core Ultra 9 285H, Python 3.14.3, 10 s timed loops.
 
-| Metric | v2.0.0 | v2.1.0 (C ext) |
-|---|---|---|
-| `from_dict` build time | 7.3s | 7.3s |
-| Lookup throughput | 67,889/s (14.7 µs) | ~340,000–680,000/s (1.5–3 µs) |
-| Serialize | 14.0/s (71.6 ms), 77.2 MiB | 14.0/s (71.6 ms), 77.2 MiB |
-| Deserialize | 1.0/s (999 ms) | 1.0/s (999 ms) |
+| Target | Lookups / s | µs / lookup | vs dict |
+|---|---|---|---|
+| `dict[k0][k1][k2]` | 228,998 | 4.4 | 1.0× (baseline) |
+| `CompactTreeFlat.get_path()` | 194,220 | 5.1 | **0.85×** |
+| `CompactTree.get_path()` (C ext) | 141,224 | 7.1 | 0.62× |
+| `CompactTree[k0][k1][k2]` (no cache) | 124,384 | 8.0 | 0.54× |
 
-*Lookup improvement requires `_marisa_ext` C extension (built automatically when a C compiler is available). Pure-Python fallback matches v2.0.0.*
+See [PERFORMANCE.md](PERFORMANCE.md) for full comparisons including PyArrow.
+
+*`CompactTreeFlat.get_path()` is ~38% faster than `CompactTree.get_path()` because a
+full-path lookup reduces to one Python `dict.__getitem__` + one `restore_key` call.*
 
 ## Contributing
 

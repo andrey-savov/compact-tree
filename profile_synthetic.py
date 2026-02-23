@@ -19,6 +19,8 @@ Usage
   python profile_synthetic.py --mode serde      # profile serialize then deserialize
   python profile_synthetic.py --l2 5000 --mode serde  # override L2 key count
   python profile_synthetic.py --mode lookup --vocab-size None  # enable auto-sized LRU cache
+  python profile_synthetic.py --mode build --shared-trie           # profile shared-trie build
+  python profile_synthetic.py --mode both  --shared-trie           # profile shared-trie build + lookup
   python profile_synthetic.py --mode lookup --use-parquet          # PyArrow table filter-based lookup
   python profile_synthetic.py --mode lookup --use-parquet --parquet-sorted  # PyArrow sorted + bisect
   python profile_synthetic.py --mode build  --use-parquet          # profile PyArrow table construction
@@ -364,7 +366,11 @@ def profile_parquet_map_build(d: dict[str, dict[str, dict[str, str]]]) -> pa.Tab
 # Profiling
 # ---------------------------------------------------------------------------
 
-def profile_ingestion(d: dict[str, dict[str, dict[str, str]]], vocabulary_size: Optional[int] = 0) -> CompactTree:
+def profile_ingestion(
+    d: dict[str, dict[str, dict[str, str]]],
+    vocabulary_size: Optional[int] = 0,
+    shared_trie: bool = False,
+) -> CompactTree:
     """Profile CompactTree.from_dict(d) and print a summary."""
     # Estimate unique keys and values to size the LRU cache exactly.
     all_keys: set[str] = set()
@@ -387,15 +393,16 @@ def profile_ingestion(d: dict[str, dict[str, dict[str, str]]], vocabulary_size: 
         if vocabulary_size is None
         else f"vocabulary_size={vocabulary_size!r} (capped cache)"
     )
+    shared_hint = "shared_trie=True (single trie for keys+values)" if shared_trie else "shared_trie=False (separate tries, default)"
     print(f"  Unique keys: {len(all_keys):,}, unique values: {len(all_values):,} "
-          f"-> {vocab_hint}")
+          f"-> {vocab_hint}  |  {shared_hint}")
 
     profiler = cProfile.Profile()
 
     print("\nProfiling CompactTree.from_dict() ...")
     wall_start = time.perf_counter()
     profiler.enable()
-    tree = CompactTree.from_dict(d, vocabulary_size=vocabulary_size)
+    tree = CompactTree.from_dict(d, vocabulary_size=vocabulary_size, shared_trie=shared_trie)
     profiler.disable()
     wall_elapsed = time.perf_counter() - wall_start
     print(f"  Wall time: {wall_elapsed:.3f}s")
@@ -786,6 +793,14 @@ if __name__ == "__main__":
              "0 (default) disables the LRU cache entirely. "
              "Pass 'None' to auto-size the cache to the full vocabulary.",
     )
+    parser.add_argument(
+        "--shared-trie",
+        action="store_true",
+        default=False,
+        dest="shared_trie",
+        help="Pass shared_trie=True to CompactTree.from_dict(), using a single "
+             "MarisaTrie for both keys and values instead of two separate tries.",
+    )
     args = parser.parse_args()
 
     # Post-parse validation
@@ -838,12 +853,12 @@ if __name__ == "__main__":
         tree = None  # CompactTree not needed when benchmarking PyArrow
     else:
         if args.mode in ("build", "both"):
-            tree = profile_ingestion(d, vocabulary_size=args.vocab_size)
+            tree = profile_ingestion(d, vocabulary_size=args.vocab_size, shared_trie=args.shared_trie)
         else:
             # Build silently for all other modes.
             print("\nBuilding CompactTree (unprofiled)...")
             t0 = time.perf_counter()
-            tree = CompactTree.from_dict(d, vocabulary_size=args.vocab_size)
+            tree = CompactTree.from_dict(d, vocabulary_size=args.vocab_size, shared_trie=args.shared_trie)
             print(f"  Built in {time.perf_counter() - t0:.3f}s")
 
     # ------------------------------------------------------------------

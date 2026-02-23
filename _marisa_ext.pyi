@@ -1,5 +1,7 @@
 """Type stubs for the _marisa_ext C extension."""
 
+from collections.abc import Callable
+
 class TrieIndex:
     """C-level radix trie index for fast word-to-int lookup."""
 
@@ -35,7 +37,7 @@ class TreeIndex:
         child_count: bytes,
         n_tree_nodes: int,
         key_trie: TrieIndex,
-        val_restore: object,
+        val_restore: Callable[[int], str],
     ) -> None: ...
 
     def get(self, node_pos: int, key: str) -> "int | str":

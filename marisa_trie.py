@@ -1,9 +1,12 @@
 """MARISA trie with minimal perfect hashing for word-to-index mapping."""
 
+from __future__ import annotations
+
 import gzip
 import struct
+from collections.abc import Iterable
 from functools import lru_cache
-from typing import BinaryIO, Iterable, Optional
+from typing import Any, BinaryIO
 from collections import deque
 
 from bitarray import bitarray
@@ -54,7 +57,7 @@ class MarisaTrie:
         """
         unique = list(dict.fromkeys(words))
         self._n = len(unique)
-        self._cache_size: Optional[int] = cache_size
+        self._cache_size: int | None = cache_size
 
         if self._n == 0:
             self._root_is_terminal: bool            = False
@@ -78,7 +81,7 @@ class MarisaTrie:
     #  Build helpers                                                       #
     # ------------------------------------------------------------------ #
 
-    def _build_intermediate_trie(self, words: list[str]) -> dict:
+    def _build_intermediate_trie(self, words: list[str]) -> dict[str, Any]:
         """Build a character-level dict-of-dicts trie from unique words."""
         root: dict = {}
         for word in words:
@@ -90,7 +93,7 @@ class MarisaTrie:
             node[""] = True
         return root
 
-    def _build_arrays(self, root: dict) -> None:
+    def _build_arrays(self, root: dict[str, Any]) -> None:
         """Path-compress the intermediate trie into parallel arrays.
 
         Populates ``_root_children``, ``_node_labels``, ``_node_terminal``,
@@ -321,7 +324,7 @@ class MarisaTrie:
     def _build_word_index(
         self,
         children_map: dict[int, list[int]],
-    ) -> "dict[str, int]":
+    ) -> dict[str, int]:
         """Build ``{word: index}`` via DFS over the just-built arrays.
 
         Uses the same pre-order assignment as ``index()``: each node's
@@ -357,7 +360,7 @@ class MarisaTrie:
     #  Forward lookup: word -> index                                       #
     # ------------------------------------------------------------------ #
 
-    def _attach_index_cache(self, cache_size: Optional[int]) -> None:
+    def _attach_index_cache(self, cache_size: int | None) -> None:
         """Install per-instance lru_caches on ``index()`` and ``restore_key()``.
 
         Uses the C extension (``_marisa_ext.TrieIndex``) when available;
@@ -506,7 +509,7 @@ class MarisaTrie:
         calls (or calls on a deserialized trie) fall back to a DFS over
         the runtime arrays.
         """
-        cached: Optional[dict[str, int]] = self.__dict__.pop("_word_to_idx", None)
+        cached: dict[str, int] | None = self.__dict__.pop("_word_to_idx", None)
         if cached is not None:
             return cached
 
@@ -543,7 +546,7 @@ class MarisaTrie:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _wrap_read_stream(stream: BinaryIO, compression: Optional[str]) -> BinaryIO:
+    def _wrap_read_stream(stream: BinaryIO, compression: str | None) -> BinaryIO:
         if compression == "gzip":
             return gzip.open(stream, "rb")  # type: ignore[return-value]
         elif compression is None:
@@ -552,7 +555,7 @@ class MarisaTrie:
             raise ValueError(f"Unsupported compression: {compression}")
 
     @staticmethod
-    def _wrap_write_stream(stream: BinaryIO, compression: Optional[str]) -> BinaryIO:
+    def _wrap_write_stream(stream: BinaryIO, compression: str | None) -> BinaryIO:
         if compression == "gzip":
             return gzip.open(stream, "wb", compresslevel=9)  # type: ignore[return-value]
         elif compression is None:
@@ -643,8 +646,8 @@ class MarisaTrie:
         cls,
         data: bytes,
         *,
-        cache_size: Optional[int] = None,
-    ) -> "MarisaTrie":
+        cache_size: int | None = None,
+    ) -> MarisaTrie:
         """Deserialize a trie from bytes, reconstructing the runtime arrays.
 
         Reconstruction is a direct ``frombytes`` over CSR arrays with no
@@ -729,42 +732,42 @@ class MarisaTrie:
         trie._attach_index_cache(cache_size)
         return trie
 
-    def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
+    def serialize(self, url: str, *, compression: str | None = None, **kwargs: Any) -> None:
         """Write the trie to a file.
 
         Args:
             url: Path or URL where to save.
-            storage_options: fsspec options.  Set ``compression='gzip'`` for gzip.
+            compression: Optional compression.  Pass ``'gzip'`` for gzip.
+            **kwargs: Additional keyword arguments forwarded to
+                ``fsspec.url_to_fs`` (e.g. S3 credentials).
         """
         from fsspec.core import url_to_fs
-        opts        = storage_options or {}
-        compression = opts.get("compression")
-        fs, path    = url_to_fs(url, **opts)
+        fs, path    = url_to_fs(url, **kwargs)
         data        = self.to_bytes()
         with fs.open(path, "wb") as raw_stream:
             with self._wrap_write_stream(raw_stream, compression) as f:
                 f.write(data)
 
     @classmethod
-    def load(cls, url: str, storage_options: Optional[dict] = None) -> "MarisaTrie":
+    def load(cls, url: str, *, compression: str | None = None, **kwargs: Any) -> MarisaTrie:
         """Load a trie from a file.
 
         Args:
             url: Path or URL to load from.
-            storage_options: fsspec options.  Set ``compression='gzip'`` if compressed.
+            compression: Optional decompression.  Pass ``'gzip'`` if compressed.
+            **kwargs: Additional keyword arguments forwarded to
+                ``fsspec.url_to_fs`` (e.g. S3 credentials).
 
         Returns:
             Loaded ``MarisaTrie``.
         """
         from fsspec.core import url_to_fs
-        opts        = storage_options or {}
-        compression = opts.get("compression")
-        fs, path    = url_to_fs(url, **opts)
+        fs, path    = url_to_fs(url, **kwargs)
         with fs.open(path, "rb") as raw_stream:
             with cls._wrap_read_stream(raw_stream, compression) as f:
                 data = f.read()
         return cls.from_bytes(data)
 
-    def __reduce__(self) -> tuple:
+    def __reduce__(self) -> tuple[type[MarisaTrie], tuple[bytes]]:
         """Support pickle by serializing to bytes."""
         return (self.from_bytes, (self.to_bytes(),))

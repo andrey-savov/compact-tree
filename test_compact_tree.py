@@ -1,3 +1,4 @@
+import pickle
 import re
 import struct
 import tempfile
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from compact_tree import CompactTree
+from compact_tree_flat import CompactTreeFlat
 
 
 
@@ -282,10 +284,10 @@ class TestCompression:
             fname = f.name
         try:
             # Serialize with gzip compression
-            ct.serialize(fname, storage_options={"compression": "gzip"})
+            ct.serialize(fname, compression="gzip")
             
             # Deserialize with gzip compression
-            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+            with CompactTree(fname, compression="gzip") as ct2:
                 assert ct2["hello"] == "world"
                 assert ct2["foo"] == "bar"
                 assert ct2.to_dict() == d
@@ -299,8 +301,8 @@ class TestCompression:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
             fname = f.name
         try:
-            ct.serialize(fname, storage_options={"compression": "gzip"})
-            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+            ct.serialize(fname, compression="gzip")
+            with CompactTree(fname, compression="gzip") as ct2:
                 assert ct2["b"]["c"]["d"] == "deep"
                 assert ct2["a"]["x"] == "1"
                 assert ct2.to_dict() == d
@@ -321,7 +323,7 @@ class TestCompression:
         try:
             # Save both compressed and uncompressed
             ct.serialize(fname_uncompressed)
-            ct.serialize(fname_compressed, storage_options={"compression": "gzip"})
+            ct.serialize(fname_compressed, compression="gzip")
             
             size_uncompressed = Path(fname_uncompressed).stat().st_size
             size_compressed = Path(fname_compressed).stat().st_size
@@ -345,7 +347,7 @@ class TestCompression:
             
             # Try to load as gzip - should fail
             with pytest.raises((AssertionError, OSError, Exception)):
-                CompactTree(fname, storage_options={"compression": "gzip"})
+                CompactTree(fname, compression="gzip")
         finally:
             Path(fname).unlink()
 
@@ -358,7 +360,7 @@ class TestCompression:
         
         try:
             with pytest.raises(ValueError, match="Unsupported compression"):
-                ct.serialize(fname, storage_options={"compression": "invalid"})
+                ct.serialize(fname, compression="invalid")
         finally:
             # Clean up in case file was created
             if Path(fname).exists():
@@ -371,8 +373,8 @@ class TestCompression:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
             fname = f.name
         try:
-            ct.serialize(fname, storage_options={"compression": "gzip"})
-            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+            ct.serialize(fname, compression="gzip")
+            with CompactTree(fname, compression="gzip") as ct2:
                 assert ct2.to_dict() == d
                 assert len(ct2) == 0
         finally:
@@ -395,8 +397,8 @@ class TestCompression:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
             fname = f.name
         try:
-            ct.serialize(fname, storage_options={"compression": "gzip"})
-            with CompactTree(fname, storage_options={"compression": "gzip"}) as ct2:
+            ct.serialize(fname, compression="gzip")
+            with CompactTree(fname, compression="gzip") as ct2:
                 assert ct2.to_dict() == d
                 # Spot check a few values
                 assert ct2["level1_0"]["level2_0"]["level3_0"] == "value_0_0_0"
@@ -411,8 +413,8 @@ class TestCompression:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
             fname = f.name
         try:
-            ct.serialize(fname, storage_options={"compression": None})
-            with CompactTree(fname, storage_options={"compression": None}) as ct2:
+            ct.serialize(fname, compression=None)
+            with CompactTree(fname, compression=None) as ct2:
                 assert ct2.to_dict() == d
         finally:
             Path(fname).unlink()
@@ -427,7 +429,7 @@ class TestCompression:
         
         try:
             with pytest.raises(ValueError, match="Unsupported compression"):
-                ct.serialize(fname, storage_options={"compression": "bzip2"})
+                ct.serialize(fname, compression="bzip2")
         finally:
             if Path(fname).exists():
                 Path(fname).unlink()
@@ -446,7 +448,7 @@ class TestCompression:
             
             # Try to load with unsupported compression
             with pytest.raises(ValueError, match="Unsupported compression"):
-                CompactTree(fname, storage_options={"compression": "bzip2"})
+                CompactTree(fname, compression="bzip2")
         finally:
             Path(fname).unlink()
 
@@ -1064,6 +1066,316 @@ class TestUnicodeAndBoundsSafety:
         )
         with pytest.raises((IndexError, KeyError)):
             ti.get(999, "a")   # node_pos 999 >> n_tree_nodes=2
+
+
+class TestSharedTrie:
+    """Tests for shared_trie=True mode."""
+
+    def test_shared_trie_basic(self):
+        """Basic ops work when shared_trie=True."""
+        d = {"a": "x", "b": "y", "c": "z"}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+        assert ct["a"] == "x"
+        assert ct["b"] == "y"
+        assert ct["c"] == "z"
+        assert "a" in ct
+        assert "d" not in ct
+        assert len(ct) == 3
+        assert set(ct) == {"a", "b", "c"}
+
+    def test_shared_trie_flag_set(self):
+        """_shared_trie flag is True and both attrs reference the same object."""
+        d = {"key": "val"}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+        assert ct._shared_trie is True
+        assert ct._key_trie is ct._val_trie
+
+    def test_separate_trie_default(self):
+        """Default from_dict uses separate tries."""
+        d = {"key": "val"}
+        ct = CompactTree.from_dict(d)
+        assert ct._shared_trie is False
+        assert ct._key_trie is not ct._val_trie
+
+    def test_shared_trie_overlapping_keys_values(self):
+        """Keys that also appear as values are stored once in the shared trie."""
+        # "a" and "b" appear as both keys and leaf values
+        d = {"a": "b", "b": "a", "c": "d"}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+        assert ct["a"] == "b"
+        assert ct["b"] == "a"
+        assert ct["c"] == "d"
+        assert ct._key_trie is ct._val_trie
+        # The shared trie covers union: {"a", "b", "c", "d"}
+        assert len(ct._key_trie) == 4
+
+    def test_shared_trie_no_overlap_same_result(self):
+        """Disjoint key/value sets: shared_trie still returns correct data."""
+        d = {"apple": "1", "banana": "2", "cherry": "3"}
+        ct_sep = CompactTree.from_dict(d)
+        ct_shr = CompactTree.from_dict(d, shared_trie=True)
+        assert ct_sep.to_dict() == ct_shr.to_dict()
+
+    def test_shared_trie_nested(self):
+        """Shared trie works with nested dicts."""
+        d = {"a": {"x": "1", "y": "2"}, "b": {"x": "3"}}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+        assert ct["a"]["x"] == "1"
+        assert ct["a"]["y"] == "2"
+        assert ct["b"]["x"] == "3"
+
+    def test_shared_trie_to_dict(self):
+        """to_dict() round-trips correctly with shared_trie=True."""
+        d = {"hello": "world", "foo": "bar", "x": {"y": "z"}}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+        assert ct.to_dict() == d
+
+    def test_shared_trie_get_path(self):
+        """get_path() works with shared_trie=True."""
+        d = {"a": {"b": {"c": "deep"}}}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+        assert ct.get_path("a", "b", "c") == "deep"
+
+    def test_shared_trie_serialize_roundtrip(self):
+        """Serialize and deserialize a shared-trie tree."""
+        d = {"a": "b", "b": "a", "c": "d"}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        try:
+            ct.serialize(fname)
+            ct2 = CompactTree(fname)
+            assert ct2._shared_trie is True
+            assert ct2._key_trie is ct2._val_trie
+            assert ct2.to_dict() == d
+        finally:
+            Path(fname).unlink()
+
+    def test_separate_trie_serialize_roundtrip(self):
+        """Serialize and deserialize a separate-trie tree (default)."""
+        d = {"a": "1", "b": "2"}
+        ct = CompactTree.from_dict(d)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree") as f:
+            fname = f.name
+        try:
+            ct.serialize(fname)
+            ct2 = CompactTree(fname)
+            assert ct2._shared_trie is False
+            assert ct2._key_trie is not ct2._val_trie
+            assert ct2.to_dict() == d
+        finally:
+            Path(fname).unlink()
+
+    def test_shared_trie_pickle_roundtrip(self):
+        """Pickle and unpickle a shared-trie tree."""
+        d = {"a": "b", "b": "a", "c": "d"}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+
+        data = pickle.dumps(ct)
+        ct2 = pickle.loads(data)
+
+        assert ct2._shared_trie is True
+        assert ct2._key_trie is ct2._val_trie
+        assert ct2.to_dict() == d
+
+    def test_shared_trie_gzip_roundtrip(self):
+        """Gzip serialize/deserialize with shared_trie=True."""
+        d = {"a": "b", "c": "d"}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctree.gz") as f:
+            fname = f.name
+        try:
+            ct.serialize(fname, compression="gzip")
+            ct2 = CompactTree(fname, compression="gzip")
+            assert ct2._shared_trie is True
+            assert ct2.to_dict() == d
+        finally:
+            Path(fname).unlink()
+
+    def test_shared_trie_invalid_type(self):
+        """shared_trie must be a bool."""
+        d = {"a": "1"}
+        with pytest.raises(TypeError, match="shared_trie must be a bool"):
+            CompactTree.from_dict(d, shared_trie=1)  # type: ignore[arg-type]
+
+    def test_shared_trie_empty_dict(self):
+        """shared_trie=True with an empty dict."""
+        d = {}
+        ct = CompactTree.from_dict(d, shared_trie=True)
+        assert ct._shared_trie is True
+        assert ct.to_dict() == d
+        assert len(ct) == 0
+
+    def test_shared_trie_with_vocabulary_size(self):
+        """shared_trie works alongside vocabulary_size."""
+        d = {"a": "x", "b": "y"}
+        ct = CompactTree.from_dict(d, shared_trie=True, vocabulary_size=10)
+        assert ct._shared_trie is True
+        assert ct.to_dict() == d
+
+
+class TestCompactTreeFlat:
+    """Tests for the CompactTreeFlat class."""
+
+    _SAMPLE: dict = {"a": {"x": "1", "y": "2"}, "b": {"x": "3"}}
+
+    def test_get_path_basic(self):
+        """get_path returns correct leaf values."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert tree.get_path("a", "x") == "1"
+        assert tree.get_path("a", "y") == "2"
+        assert tree.get_path("b", "x") == "3"
+
+    def test_get_path_miss(self):
+        """get_path raises KeyError on missing path."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with pytest.raises(KeyError):
+            tree.get_path("a", "z")
+        with pytest.raises(KeyError):
+            tree.get_path("c", "x")
+
+    def test_get_path_no_keys_raises(self):
+        """get_path() with no args raises TypeError."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with pytest.raises(TypeError):
+            tree.get_path()
+
+    def test_contains_tuple(self):
+        """__contains__ works with full tuple paths."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert ("a", "x") in tree
+        assert ("b", "x") in tree
+        assert ("a", "z") not in tree
+        assert ("c",) not in tree
+
+    def test_len(self):
+        """__len__ returns total number of leaf paths."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert len(tree) == 3
+
+    def test_to_dict_roundtrip(self):
+        """to_dict() reconstructs the original nested dict."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert tree.to_dict() == self._SAMPLE
+
+    def test_to_dict_flat(self):
+        """to_dict() works on a flat (1-level) dict."""
+        d = {"a": "1", "b": "2", "c": "3"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert tree.to_dict() == d
+
+    def test_empty_dict(self):
+        """from_dict with empty dict produces empty tree."""
+        tree = CompactTreeFlat.from_dict({})
+        assert len(tree) == 0
+        assert tree.to_dict() == {}
+
+    def test_serialize_roundtrip(self):
+        """serialize() + CompactTreeFlat(path) roundtrip."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctflat") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname)
+            tree2 = CompactTreeFlat(fname)
+            assert tree2.to_dict() == self._SAMPLE
+            assert len(tree2) == 3
+        finally:
+            Path(fname).unlink()
+
+    def test_serialize_gzip_roundtrip(self):
+        """gzip serialize/deserialize roundtrip."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctflat.gz") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname, compression="gzip")
+            tree2 = CompactTreeFlat(fname, compression="gzip")
+            assert tree2.to_dict() == self._SAMPLE
+        finally:
+            Path(fname).unlink()
+
+    def test_pickle_roundtrip(self):
+        """Pickle and unpickle preserves all data."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        data = pickle.dumps(tree)
+        tree2 = pickle.loads(data)
+        assert tree2.to_dict() == self._SAMPLE
+        assert len(tree2) == 3
+        assert tree2.get_path("a", "y") == "2"
+
+    def test_vocabulary_size_kwarg(self):
+        """vocabulary_size kwarg is accepted and stored."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=10)
+        assert tree._val_vocab_size == 10
+        assert tree.to_dict() == self._SAMPLE
+
+    def test_vocabulary_size_none(self):
+        """vocabulary_size=None auto-sizes cache."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=None)
+        assert tree._val_vocab_size == len({"1", "2", "3"})
+        assert tree.to_dict() == self._SAMPLE
+
+    def test_vocabulary_size_invalid_type(self):
+        """vocabulary_size with invalid type raises TypeError."""
+        with pytest.raises(TypeError, match="vocabulary_size must be an int"):
+            CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size="big")  # type: ignore[arg-type]
+
+    def test_vocabulary_size_negative(self):
+        """vocabulary_size negative raises ValueError."""
+        with pytest.raises(ValueError):
+            CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=-1)
+
+    def test_deep_nesting(self):
+        """Works with 4-level deep nesting."""
+        d = {"a": {"b": {"c": {"d": "leaf"}}}}
+        tree = CompactTreeFlat.from_dict(d)
+        assert tree.get_path("a", "b", "c", "d") == "leaf"
+        assert len(tree) == 1
+        assert tree.to_dict() == d
+
+    def test_non_string_values_coerced(self):
+        """Non-string leaf values are coerced to str."""
+        d = {"a": {"x": 42, "y": 3.14}}  # type: ignore[dict-item]
+        tree = CompactTreeFlat.from_dict(d)
+        assert tree.get_path("a", "x") == "42"
+        assert tree.get_path("a", "y") == "3.14"
+
+    def test_repr(self):
+        """__repr__ returns a round-trippable string."""
+        d = {"x": "1"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert repr(tree) == f"CompactTreeFlat.from_dict({d!r})"
+
+    def test_str(self):
+        """__str__ returns the nested dict string."""
+        d = {"x": "1"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert str(tree) == str(d)
+
+    def test_overlapping_values(self):
+        """Repeated leaf values are deduplicated in _val_trie."""
+        d = {"a": "same", "b": "same", "c": "other"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert len(tree._val_trie) == 2  # only 2 unique values
+        assert tree.get_path("a") == "same"
+        assert tree.get_path("b") == "same"
+        assert tree.get_path("c") == "other"
+
+    def test_serialize_vocab_size_preserved(self):
+        """vocabulary_size is preserved across serialize/deserialize."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=5)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctflat") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname)
+            tree2 = CompactTreeFlat(fname)
+            assert tree2._val_vocab_size == 5
+        finally:
+            Path(fname).unlink()
 
 
 if __name__ == "__main__":

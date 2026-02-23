@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-02-22
+
+### Added
+
+- **`CompactTreeFlat`** (new module `compact_tree_flat.py`) — flat tuple-keyed store
+  backed by a single value `MarisaTrie`.  Unlike `CompactTree`, it discards the
+  nested-dict structure and stores every leaf as a `tuple[str, …] → val_id` mapping.
+  The only lookup interface is `get_path(*keys)`, which takes all path components
+  at once and returns the leaf value directly with no intermediate `_Node` objects.
+  Supports `__contains__`, `__len__`, `to_dict()`, `serialize()`, gzip compression,
+  and pickle.  Binary format: `CTFlt v1`.
+  **Lookup performance** (Windows, L2=173 K, 10 s): 194 K /s (5.1 µs), versus
+  141 K /s (7.1 µs) for `CompactTree.get_path()` — **~38% faster** because a
+  full-path lookup reduces to one Python `dict.__getitem__` + one `restore_key` call.
+- `CompactTree.from_dict(…, shared_trie=True)` — build a single `MarisaTrie` from
+  the union of all keys and leaf values.  Strings that appear as both a key and a
+  value are stored only once, reducing memory when the key/value vocabularies overlap.
+  The same object is assigned to both `_key_trie` and `_val_trie`; the flag
+  `_shared_trie: bool` records which mode was used.
+
+### Changed
+
+- **Binary format bumped from v5 to v6.**  The header now contains 8 × `uint64`
+  fields: `shared_flag`, `keys_trie_len`, `val_trie_len`, `child_count_len`,
+  `vcol_len`, `elbl_len`, `key_vocab_size`, `val_vocab_size`.  When `shared_flag=1`
+  no value-trie blob is written (`val_trie_len=0`).  Files in v5 or earlier are no
+  longer readable.
+- `CompactTree.__init__` and `CompactTree.serialize` now accept `compression` as a
+  bare keyword argument (e.g. `compression="gzip"`) instead of
+  `storage_options={"compression": "gzip"}`.  Extra fsspec auth options
+  (S3 credentials, etc.) can be forwarded via `**kwargs`.
+- `MarisaTrie.serialize` and `MarisaTrie.load` follow the same pattern: bare
+  `compression=` kwarg plus `**kwargs` for fsspec passthrough.
+- `storage_options` parameter removed from all four serialize/load methods.
+- Type annotations modernised: `from __future__ import annotations` added to both
+  `compact_tree.py` and `marisa_trie.py`; all `Optional[X]` replaced with `X | None`;
+  string forward-references replaced with bare names; `Iterator` and `Iterable`
+  moved from `typing` to `collections.abc`; `_marisa_ext.pyi` stub now types
+  `val_restore` as `Callable[[int], str]`.
+
 ## [2.1.1] - 2026-02-21
 
 ### Fixed
@@ -207,7 +247,8 @@ Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entr
 - succinct >= 0.0.7
 - fsspec >= 2021.0.0
 
-[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/andrey-savov/compact-tree/compare/v2.1.1...v3.0.0
 [2.1.1]: https://github.com/andrey-savov/compact-tree/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/andrey-savov/compact-tree/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/andrey-savov/compact-tree/compare/v1.2.1...v2.0.0
