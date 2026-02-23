@@ -209,7 +209,7 @@ class CompactTreeFlat:
         obj = cls.__new__(cls)
         obj._key_dict = key_dict
         obj._val_trie = val_trie
-        obj._val_vocab_size: int = val_cache_size
+        obj._val_vocab_size = val_cache_size
         return obj
 
     # ------------------------------------------------------------------ #
