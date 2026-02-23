@@ -73,20 +73,23 @@ three PyArrow table layouts.
 
 | Target | Lookups / s | µs / lookup | vs dict |
 |---|---|---|---|
-| `dict[k0][k1][k2]` | 256,157 | 3.9 | 1.0× (baseline) |
-| `CompactTree[k0][k1][k2]` (no LRU cache, default) | 137,149 | 7.3 | 0.54× |
-| `CompactTree[k0][k1][k2]` (LRU cache, `vocabulary_size=None`) | 141,112 | 7.1 | 0.55× |
-| PyArrow flat table, sorted + bisect | 122,284 | 8.2 | 0.48× |
-| PyArrow nested map (`pc.map_lookup` × 3) | 72 | 13,981 | 0.00028× |
-| PyArrow flat table, filter scan | 42 | 23,917 | 0.00016× |
+| `dict[k0][k1][k2]` | 245,520 | 4.1 | 1.0× (baseline) |
+| `CompactTreeFlat.get_path()` † | 190,870 | 5.2 | 0.82× †|
+| `CompactTree.get_path()` (C extension) † | 157,793 | 6.3 | 0.67× †|
+| `CompactTree[k0][k1][k2]` (no LRU cache, default) | 133,796 | 7.5 | 0.55× |
+| `CompactTree[k0][k1][k2]` (no LRU cache, `shared_trie=True`) | 131,422 | 7.6 | 0.54× |
+| `CompactTree[k0][k1][k2]` (LRU cache, `vocabulary_size=None`) | 133,682 | 7.5 | 0.54× |
+| PyArrow flat table, sorted + bisect | 120,420 | 8.3 | 0.49× |
+| PyArrow nested map (`pc.map_lookup` × 3) | 67 | 14,857 | 0.00027× |
+| PyArrow flat table, filter scan | 41 | 24,609 | 0.00017× |
 
 ### Notes
 
 * **CompactTree vs sorted-bisect PyArrow** are within measurement noise of
   each other (~7.1–8.8 µs across platforms). Both are roughly 2× slower than
   a native dict on both platforms.
-* **Linux vs Windows**: Linux (WSL2) shows ~20% higher throughput for dict and
-  CompactTree (~256K vs ~236K and ~141K vs ~117K lookups/s), consistent with
+* **Linux vs Windows**: Linux (WSL2) shows ~4–8% higher throughput for dict and
+  CompactTree (~246K vs ~236K and ~134K vs ~124K lookups/s), consistent with
   lower syscall/scheduler overhead in native Linux execution.
 * **LRU cache vs no cache** (now default): with `vocabulary_size=0` (the
   default) the per-instance `lru_cache` on `index()` is disabled and every
@@ -105,10 +108,12 @@ three PyArrow table layouts.
 * **`CompactTreeFlat.get_path()`** (†) is measured via `profile_compact_tree_flat.py`
   using its own timed loop (10 s, same L2=173,000 dataset, 10% miss ratio).
   The vs-dict ratios for the `†` rows use the dict baseline from that same
-  run (228,998 /s, 4.4 µs) rather than the 235,958 /s figure above.
-  `CompactTreeFlat` is ~38% faster than `CompactTree.get_path()` because a
-  full-path lookup reduces to a single Python `dict.__getitem__` call plus one
-  `MarisaTrie.restore_key()` call, with no CSR trie traversal.
+  run — Win: 228,998 /s (4.4 µs), Linux: 233,879 /s (4.3 µs) — rather than
+  the separate `profile_synthetic.py` dict figures above.
+  `CompactTreeFlat` is ~38% faster than `CompactTree.get_path()` on Windows
+  and ~21% faster on Linux, because a full-path lookup reduces to a single
+  Python `dict.__getitem__` call plus one `MarisaTrie.restore_key()` call,
+  with no CSR trie traversal.
 * **PyArrow flat filter** and **nested map** are O(N) scans over all 173K rows
   per lookup — roughly 1,500–3,500× slower than the indexed approaches. They
   are included for completeness, not as practical lookup strategies.
