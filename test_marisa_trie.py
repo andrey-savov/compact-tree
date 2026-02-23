@@ -276,10 +276,10 @@ class TestCompression:
         
         try:
             # Serialize with gzip
-            trie.serialize(tmp_path, storage_options={"compression": "gzip"})
+            trie.serialize(tmp_path, compression="gzip")
             
             # Load back with gzip
-            trie2 = MarisaTrie.load(tmp_path, storage_options={"compression": "gzip"})
+            trie2 = MarisaTrie.load(tmp_path, compression="gzip")
             
             # Verify
             assert len(trie2) == len(trie)
@@ -298,7 +298,7 @@ class TestCompression:
         
         try:
             with pytest.raises(ValueError, match="Unsupported compression"):
-                trie.serialize(tmp_path, storage_options={"compression": "bzip2"})
+                trie.serialize(tmp_path, compression="bzip2")
         finally:
             # Clean up if file was created
             if Path(tmp_path).exists():
@@ -317,7 +317,7 @@ class TestCompression:
             
             # Try to load with unsupported compression
             with pytest.raises(ValueError, match="Unsupported compression"):
-                MarisaTrie.load(tmp_path, storage_options={"compression": "bzip2"})
+                MarisaTrie.load(tmp_path, compression="bzip2")
         finally:
             Path(tmp_path).unlink()
 

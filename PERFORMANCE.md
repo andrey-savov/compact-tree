@@ -60,7 +60,8 @@ three PyArrow table layouts.
 | Target | Lookups / s | µs / lookup | vs dict |
 |---|---|---|---|
 | `dict[k0][k1][k2]` | 235,958 | 4.2 | 1.0× (baseline) |
-| `CompactTree[k0][k1][k2]` (no LRU cache, default) | 119,100 | 8.4 | 0.50× |
+| `CompactTree[k0][k1][k2]` (no LRU cache, default) | 124,384 | 8.0 | 0.53× |
+| `CompactTree[k0][k1][k2]` (no LRU cache, `shared_trie=True`) | 123,573 | 8.1 | 0.52× |
 | `CompactTree[k0][k1][k2]` (LRU cache, `vocabulary_size=None`) | 116,589 | 8.6 | 0.49× |
 | PyArrow flat table, sorted + bisect | 113,450 | 8.8 | 0.48× |
 | PyArrow nested map (`pc.map_lookup` × 3) | 64 | 15,734 | 0.00027× |
@@ -93,6 +94,12 @@ three PyArrow table layouts.
   trie walk on a hit, the two variants measure within noise of each other on
   both platforms (~7–9 µs). The cache is therefore disabled by default; pass
   `vocabulary_size=None` to `from_dict()` to re-enable auto-sized caching.
+* **`shared_trie=True`** uses a single `MarisaTrie` for both keys and values
+  instead of two separate tries. Lookup throughput is identical within
+  measurement noise (8.0 vs 8.1 µs on Windows) because the dominant cost is
+  the C-level `TreeIndex.get` traversal, which is unchanged. The benefit is
+  lower memory usage when key and value vocabularies overlap significantly;
+  pass `shared_trie=True` to `from_dict()` to enable it.
 * **PyArrow flat filter** and **nested map** are O(N) scans over all 173K rows
   per lookup — roughly 1,500–3,500× slower than the indexed approaches. They
   are included for completeness, not as practical lookup strategies.
@@ -109,7 +116,8 @@ loop). Representative wall times at L2 = 173,000:
 
 | Target | Wall time (s) | Output size |
 |---|---|---|
-| `CompactTree.from_dict()` | ~6–7 s | — |
+| `CompactTree.from_dict()` (separate tries, default) | ~11 s | — |
+| `CompactTree.from_dict()` (`shared_trie=True`) | ~11 s | — |
 | `dict_to_arrow_table()` (unsorted) | ~0.5 s | ~50 MiB |
 | `dict_to_arrow_table()` (sorted, +`_skey`) | ~0.7 s | ~65 MiB |
 | `dict_to_arrow_map_table()` (1-row nested map) | ~3–4 s | ~45 MiB |
@@ -119,16 +127,18 @@ loop). Representative wall times at L2 = 173,000:
 ## How to reproduce
 
 ```bash
-# Lookup benchmarks (5 s each)
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5                         # no LRU cache (default)
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --vocab-size None       # LRU cache, auto-sized
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --use-dict
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --use-parquet --parquet-sorted
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --use-parquet-map
-python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 5 --use-parquet
+# Lookup benchmarks (10 s each)
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10                         # no LRU cache (default)
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --shared-trie           # shared trie, no LRU cache
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --vocab-size None       # LRU cache, auto-sized
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --use-dict
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --use-parquet --parquet-sorted
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --use-parquet-map
+python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --use-parquet
 
 # Build benchmarks
 python profile_synthetic.py --mode build --l2 173000
+python profile_synthetic.py --mode build --l2 173000 --shared-trie
 python profile_synthetic.py --mode build --l2 173000 --use-parquet
 python profile_synthetic.py --mode build --l2 173000 --use-parquet --parquet-sorted
 python profile_synthetic.py --mode build --l2 173000 --use-parquet-map

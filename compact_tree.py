@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import array
 import bisect
 import gzip
 import struct
 import sys
-from typing import Any, BinaryIO, Iterator, Optional
+from collections.abc import Callable, Iterator
+from typing import Any, BinaryIO
 
 from marisa_trie import MarisaTrie
 
@@ -33,7 +36,7 @@ class CompactTree:
     @staticmethod
     def _walk_dict(d: dict[str, Any], keys_out: set[str],
                    values_out: set[str],
-                   _seen_ids: Optional[set] = None) -> None:
+                   _seen_ids: set[int] | None = None) -> None:
         """Recursively collect all keys and unique leaf values.
 
         Two shortcuts avoid redundant work at scale:
@@ -88,7 +91,7 @@ class CompactTree:
         return out
 
     @staticmethod
-    def _wrap_read_stream(stream: BinaryIO, compression: Optional[str]) -> BinaryIO:
+    def _wrap_read_stream(stream: BinaryIO, compression: str | None) -> BinaryIO:
         """Wrap a file stream with decompression if needed."""
         if compression == "gzip":
             return gzip.open(stream, "rb")  # type: ignore[return-value]
@@ -98,7 +101,7 @@ class CompactTree:
             raise ValueError(f"Unsupported compression: {compression}")
 
     @staticmethod
-    def _wrap_write_stream(stream: BinaryIO, compression: Optional[str]) -> BinaryIO:
+    def _wrap_write_stream(stream: BinaryIO, compression: str | None) -> BinaryIO:
         """Wrap a file stream with compression if needed."""
         if compression == "gzip":
             return gzip.open(stream, "wb", compresslevel=9)  # type: ignore[return-value]
@@ -113,7 +116,8 @@ class CompactTree:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *,
-                  vocabulary_size: Optional[int] = 0) -> "CompactTree":
+                  vocabulary_size: int | None = 0,
+                  shared_trie: bool = False) -> CompactTree:
         """Build a *CompactTree* entirely in memory from a nested Python dict.
 
         Keys must be strings.  Leaf values are stored as strings (non-string
@@ -126,6 +130,11 @@ class CompactTree:
                 Pass ``None`` to auto-size the cache to the full vocabulary
                 (zero evictions), or a positive int to cap memory use at the
                 cost of occasional re-traversals.
+            shared_trie: When ``True``, a single ``MarisaTrie`` is built from
+                the union of all keys and leaf values.  Strings that appear as
+                both a key and a value are stored only once, reducing memory
+                when the key/value vocabularies overlap.  Defaults to
+                ``False`` (separate tries, classic behaviour).
         """
         if vocabulary_size is not None:
             # Validate type explicitly to provide a clear error for invalid inputs
@@ -142,32 +151,51 @@ class CompactTree:
                     f"or a positive integer; got {vocabulary_size!r}"
                 )
 
+        if not isinstance(shared_trie, bool):
+            raise TypeError(
+                f"shared_trie must be a bool; got "
+                f"{type(shared_trie).__name__}: {shared_trie!r}"
+            )
+
         # 1. Collect vocabulary and leaf values
         all_keys: set[str] = set()
         unique_values: set[str] = set()
         cls._walk_dict(data, all_keys, unique_values)
 
-        # Determine per-trie cache sizes: honour the caller's hint (applied to
-        # both tries) or fall back to the exact vocabulary size for each trie.
-        if vocabulary_size is not None:
-            key_cache_size: int = vocabulary_size
-            val_cache_size: int = vocabulary_size
+        # Build tries and vocabulary id mappings.
+        # When shared_trie=True a single MarisaTrie covers the union of keys
+        # and values so that strings appearing in both are stored only once.
+        if shared_trie:
+            combined = all_keys | unique_values
+            shared_cache_size: int = (
+                vocabulary_size if vocabulary_size is not None else len(combined)
+            )
+            key_trie = MarisaTrie(combined, cache_size=shared_cache_size)
+            val_trie = key_trie
+            key_cache_size: int = shared_cache_size
+            val_cache_size: int = shared_cache_size
         else:
-            key_cache_size = len(all_keys)
-            val_cache_size = len(unique_values)
+            # Determine per-trie cache sizes: honour the caller's hint (applied to
+            # both tries) or fall back to the exact vocabulary size for each trie.
+            if vocabulary_size is not None:
+                key_cache_size = vocabulary_size
+                val_cache_size = vocabulary_size
+            else:
+                key_cache_size = len(all_keys)
+                val_cache_size = len(unique_values)
 
-        # 2. Build MarisaTrie for keys (deduplicated)
-        key_trie = MarisaTrie(all_keys, cache_size=key_cache_size)
+            # 2. Build MarisaTrie for keys (deduplicated)
+            key_trie = MarisaTrie(all_keys, cache_size=key_cache_size)
 
-        # 3. Build MarisaTrie for values (deduplicated)
-        val_trie = MarisaTrie(unique_values, cache_size=val_cache_size)
+            # 3. Build MarisaTrie for values (deduplicated)
+            val_trie = MarisaTrie(unique_values, cache_size=val_cache_size)
 
         # Build plain {word: idx} dicts via a single DFS over each trie.
         # This replaces the old pre-warm loop: instead of N individual trie
         # traversals (one per unique word), we do exactly one O(N) DFS pass
         # per trie, eliminating all rank/select overhead for the warm-up phase.
         key_id: dict[str, int] = key_trie.to_dict()
-        val_id: dict[str, int] = val_trie.to_dict()
+        val_id: dict[str, int] = key_id if val_trie is key_trie else val_trie.to_dict()
 
         # 4. BFS -> CSR arrays + vcol + elbl
         import array as _array
@@ -294,6 +322,7 @@ class CompactTree:
         tree.mm = None
         tree._key_trie = key_trie
         tree._val_trie = val_trie
+        tree._shared_trie = shared_trie
         tree._key_vocab_size = key_cache_size
         tree._val_vocab_size = val_cache_size
         tree._child_start = _child_start_arr
@@ -308,32 +337,32 @@ class CompactTree:
     #  Factory: from file / deserialize                                  #
     # ------------------------------------------------------------------ #
 
-    def __init__(self, url: str, storage_options: Optional[dict] = None):
+    def __init__(self, url: str, *, compression: str | None = None, **kwargs: Any) -> None:
         """Deserialize a *CompactTree* from storage.
-        
+
         Args:
             url: Path or URL to the CompactTree file.
-            storage_options: fsspec options. Set compression='gzip' to read
-                           gzip-compressed files.
+            compression: Optional decompression to apply.  Pass
+                ``'gzip'`` for gzip-compressed files.
+            **kwargs: Additional keyword arguments forwarded to
+                ``fsspec.url_to_fs`` (e.g. S3 credentials).
         """
         from fsspec.core import url_to_fs
 
-        opts = storage_options or {}
-        compression = opts.get("compression")
-        fs, path = url_to_fs(url, **opts)
-        
+        fs, path = url_to_fs(url, **kwargs)
+
         with fs.open(path, "rb") as raw_stream:
             with self._wrap_read_stream(raw_stream, compression) as f:
                 # Read header
                 magic, ver = struct.unpack("<5sQ", f.read(13))
-                assert magic == b"CTree" and ver == 5, (
-                    f"Unsupported CompactTree format version {ver} (expected 5)"
+                assert magic == b"CTree" and ver == 6, (
+                    f"Unsupported CompactTree format version {ver} (expected 6)"
                 )
 
                 (
-                    keys_len, val_len, child_count_len, vcol_len, elbl_len,
-                    _key_vocab_size, _val_vocab_size,
-                ) = struct.unpack("<QQQQQQQ", f.read(56))
+                    shared_flag, keys_len, val_len, child_count_len, vcol_len,
+                    elbl_len, _key_vocab_size, _val_vocab_size,
+                ) = struct.unpack("<QQQQQQQQ", f.read(64))
 
                 # Read and parse keys MarisaTrie
                 keys_bytes = f.read(keys_len)
@@ -342,12 +371,18 @@ class CompactTree:
                     cache_size=_key_vocab_size,
                 )
 
-                # Read values MarisaTrie
-                val_bytes = f.read(val_len)
-                self._val_trie = MarisaTrie.from_bytes(
-                    val_bytes,
-                    cache_size=_val_vocab_size,
-                )
+                if shared_flag:
+                    # Shared trie: keys and values use the same MarisaTrie
+                    self._val_trie = self._key_trie
+                    self._shared_trie = True
+                else:
+                    # Separate tries: read independent value trie
+                    val_bytes = f.read(val_len)
+                    self._val_trie = MarisaTrie.from_bytes(
+                        val_bytes,
+                        cache_size=_val_vocab_size,
+                    )
+                    self._shared_trie = False
 
                 self._key_vocab_size = _key_vocab_size
                 self._val_vocab_size = _val_vocab_size
@@ -380,22 +415,22 @@ class CompactTree:
     #  serialize                                                           #
     # ------------------------------------------------------------------ #
 
-    def serialize(self, url: str, storage_options: Optional[dict] = None) -> None:
+    def serialize(self, url: str, *, compression: str | None = None, **kwargs: Any) -> None:
         """Write the tree to *url* in binary format.
-        
+
         Args:
             url: Path or URL where to save the CompactTree.
-            storage_options: fsspec options. Set compression='gzip' to write
-                           gzip-compressed output (level 9).
+            compression: Optional compression to apply.  Pass ``'gzip'``
+                for gzip output (level 9).
+            **kwargs: Additional keyword arguments forwarded to
+                ``fsspec.url_to_fs`` (e.g. S3 credentials).
         """
         from fsspec.core import url_to_fs
 
-        opts = storage_options or {}
-        compression = opts.get("compression")
-        fs, path = url_to_fs(url, **opts)
-        
+        fs, path = url_to_fs(url, **kwargs)
+
         keys_bytes = self._key_trie.to_bytes()
-        val_bytes = self._val_trie.to_bytes()
+        val_bytes = b"" if self._shared_trie else self._val_trie.to_bytes()
         _cc = self._child_count
         if sys.byteorder != 'little':
             _cc = array.array('I', _cc); _cc.byteswap()
@@ -412,9 +447,10 @@ class CompactTree:
         with fs.open(path, "wb") as raw_stream:
             with self._wrap_write_stream(raw_stream, compression) as f:
                 f.write(b"CTree")
-                f.write(struct.pack("<Q", 5))
+                f.write(struct.pack("<Q", 6))
                 f.write(struct.pack(
-                    "<QQQQQQQ",
+                    "<QQQQQQQQ",
+                    1 if self._shared_trie else 0,
                     len(keys_bytes), len(val_bytes), len(child_count_bytes),
                     len(vcol_bytes), len(elbl_bytes),
                     self._key_vocab_size,
@@ -430,7 +466,7 @@ class CompactTree:
     #  to_dict                                                             #
     # ------------------------------------------------------------------ #
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Materialise the tree back into a plain nested Python dict."""
         def _build(kids: list[int]) -> dict:
             out: dict[str, object] = {}
@@ -478,7 +514,7 @@ class CompactTree:
         count = self._child_count[pos]
         return list(range(start, start + count))
 
-    def _find_child(self, v: int, key_vid: int) -> Optional[int]:
+    def _find_child(self, v: int, key_vid: int) -> int | None:
         """Binary search among children of node *v* for edge label == *key_vid*.
 
         Valid because children are emitted sorted by key_id during from_dict.
@@ -494,7 +530,7 @@ class CompactTree:
             return pos + 1             # back to 1-indexed node position
         return None
 
-    def _resolve(self, child_pos: int) -> "str | CompactTree._Node":
+    def _resolve(self, child_pos: int) -> str | CompactTree._Node:
         """Resolve a child position to either a leaf string or a ``_Node``."""
         vv = self.vcol[child_pos - 1]
         if vv == _INTERNAL:
@@ -506,7 +542,7 @@ class CompactTree:
     # ------------------------------------------------------------------ #
 
     class _Node:
-        def __init__(self, tree: "CompactTree", pos: int):
+        def __init__(self, tree: CompactTree, pos: int) -> None:
             self.tree = tree
             self.pos = pos
 
@@ -645,13 +681,13 @@ class CompactTree:
         if self.f is not None:
             self.f.close()
 
-    def __enter__(self) -> "CompactTree":
+    def __enter__(self) -> CompactTree:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def __reduce__(self) -> tuple:
+    def __reduce__(self) -> tuple[Callable[..., CompactTree], tuple[bytes]]:
         """Support pickle by using serialize/deserialize.
         
         Returns a tuple (callable, args) where callable(*args) reconstructs the object.
@@ -660,7 +696,7 @@ class CompactTree:
         buf = io.BytesIO()
         # Serialize to an in-memory buffer
         keys_bytes = self._key_trie.to_bytes()
-        val_bytes = self._val_trie.to_bytes()
+        val_bytes = b"" if self._shared_trie else self._val_trie.to_bytes()
         _cc = self._child_count
         if sys.byteorder != 'little':
             _cc = array.array('I', _cc); _cc.byteswap()
@@ -675,9 +711,10 @@ class CompactTree:
         elbl_bytes = _elbl.tobytes()
         
         buf.write(b"CTree")
-        buf.write(struct.pack("<Q", 5))
+        buf.write(struct.pack("<Q", 6))
         buf.write(struct.pack(
-            "<QQQQQQQ",
+            "<QQQQQQQQ",
+            1 if self._shared_trie else 0,
             len(keys_bytes), len(val_bytes), len(child_count_bytes),
             len(vcol_bytes), len(elbl_bytes),
             self._key_vocab_size,
@@ -693,21 +730,21 @@ class CompactTree:
         return (self._unpickle_from_bytes, (serialized,))
 
     @staticmethod
-    def _unpickle_from_bytes(data: bytes) -> "CompactTree":
+    def _unpickle_from_bytes(data: bytes) -> CompactTree:
         """Reconstruct CompactTree from serialized bytes (used by pickle)."""
         import io
         f = io.BytesIO(data)
-        
+
         # Read header
         magic, ver = struct.unpack("<5sQ", f.read(13))
-        assert magic == b"CTree" and ver == 5, (
-            f"Unsupported CompactTree format version {ver} (expected 5)"
+        assert magic == b"CTree" and ver == 6, (
+            f"Unsupported CompactTree format version {ver} (expected 6)"
         )
 
         (
-            keys_len, val_len, child_count_len, vcol_len, elbl_len,
-            _key_vocab_size, _val_vocab_size,
-        ) = struct.unpack("<QQQQQQQ", f.read(56))
+            shared_flag, keys_len, val_len, child_count_len, vcol_len,
+            elbl_len, _key_vocab_size, _val_vocab_size,
+        ) = struct.unpack("<QQQQQQQQ", f.read(64))
 
         # Read and parse keys MarisaTrie
         tree = CompactTree.__new__(CompactTree)
@@ -717,12 +754,16 @@ class CompactTree:
             cache_size=_key_vocab_size,
         )
 
-        # Read values MarisaTrie
-        val_bytes = f.read(val_len)
-        tree._val_trie = MarisaTrie.from_bytes(
-            val_bytes,
-            cache_size=_val_vocab_size,
-        )
+        if shared_flag:
+            tree._val_trie = tree._key_trie
+            tree._shared_trie = True
+        else:
+            val_bytes = f.read(val_len)
+            tree._val_trie = MarisaTrie.from_bytes(
+                val_bytes,
+                cache_size=_val_vocab_size,
+            )
+            tree._shared_trie = False
 
         tree._key_vocab_size = _key_vocab_size
         tree._val_vocab_size = _val_vocab_size

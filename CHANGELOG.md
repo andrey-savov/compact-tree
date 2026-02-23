@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CompactTree.from_dict(…, shared_trie=True)` — build a single `MarisaTrie` from
+  the union of all keys and leaf values.  Strings that appear as both a key and a
+  value are stored only once, reducing memory when the key/value vocabularies overlap.
+  The same object is assigned to both `_key_trie` and `_val_trie`; the flag
+  `_shared_trie: bool` records which mode was used.
+
+### Changed
+
+- **Binary format bumped from v5 to v6.**  The header now contains 8 × `uint64`
+  fields: `shared_flag`, `keys_trie_len`, `val_trie_len`, `child_count_len`,
+  `vcol_len`, `elbl_len`, `key_vocab_size`, `val_vocab_size`.  When `shared_flag=1`
+  no value-trie blob is written (`val_trie_len=0`).  Files in v5 or earlier are no
+  longer readable.
+- `CompactTree.__init__` and `CompactTree.serialize` now accept `compression` as a
+  bare keyword argument (e.g. `compression="gzip"`) instead of
+  `storage_options={"compression": "gzip"}`.  Extra fsspec auth options
+  (S3 credentials, etc.) can be forwarded via `**kwargs`.
+- `MarisaTrie.serialize` and `MarisaTrie.load` follow the same pattern: bare
+  `compression=` kwarg plus `**kwargs` for fsspec passthrough.
+- `storage_options` parameter removed from all four serialize/load methods.
+- Type annotations modernised: `from __future__ import annotations` added to both
+  `compact_tree.py` and `marisa_trie.py`; all `Optional[X]` replaced with `X | None`;
+  string forward-references replaced with bare names; `Iterator` and `Iterable`
+  moved from `typing` to `collections.abc`; `_marisa_ext.pyi` stub now types
+  `val_restore` as `Callable[[int], str]`.
+
 ## [2.1.1] - 2026-02-21
 
 ### Fixed

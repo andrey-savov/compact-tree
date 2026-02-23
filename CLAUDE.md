@@ -67,6 +67,8 @@ CompactTree
   +-- vcol         : array.array('I')  value column (uint32: value id or 0xFFFFFFFF for internal)
   +-- _key_trie    : MarisaTrie        key vocabulary (word <-> dense index)
   +-- _val_trie    : MarisaTrie        value vocabulary (word <-> dense index)
+                                       (same object as _key_trie when shared_trie=True)
+  +-- _shared_trie : bool              True when a single MarisaTrie covers keys and values
   +-- _c_tree      : TreeIndex | None  optional C-level traversal helper
 ```
 
@@ -103,23 +105,24 @@ call made by `CompactTree.from_dict()`, keeping steady-state memory minimal.
 ### from_dict build pipeline
 
 ```
-from_dict(data, *, vocabulary_size=0)
+from_dict(data, *, vocabulary_size=0, shared_trie=False)
   |
   +-- _walk_dict()              collect all_keys (set) + unique_values (set)
   |
-  +-- key_cache_size  =  vocabulary_size   (0 = disabled [default]; None = len(all_keys))
-  +-- val_cache_size  =  vocabulary_size   (0 = disabled [default]; None = len(unique_values))
+  +-- shared_trie=False (default): separate tries
+  |     key_cache_size  =  vocabulary_size   (0 = disabled; None = len(all_keys))
+  |     val_cache_size  =  vocabulary_size   (0 = disabled; None = len(unique_values))
+  |     MarisaTrie(all_keys, cache_size=key_cache_size)      build key trie
+  |     MarisaTrie(unique_values, cache_size=val_cache_size) build value trie
   |
-  +-- MarisaTrie(all_keys, cache_size=key_cache_size)      build key trie
-  |     _build_intermediate_trie() -> dict-of-dicts
-  |     _build_arrays()         -> CSR arrays + _counts + _word_to_idx (via DFS in _build_word_index)
-  |     _build_navigation_tables()  -> _node_label_lens + _first_char_maps + _prefix_counts
-  |     _build_c_index()            -> _c_index (TrieIndex) if _marisa_ext is available
-  |
-  +-- MarisaTrie(unique_values, cache_size=val_cache_size) build value trie  (same pipeline)
+  +-- shared_trie=True: single shared trie
+  |     combined        =  all_keys | unique_values
+  |     shared_cache_size = vocabulary_size if given, else len(combined)
+  |     MarisaTrie(combined, cache_size=shared_cache_size)   one trie for both
+  |     key_trie = val_trie = shared trie
   |
   +-- key_trie.to_dict()        O(N) pop of _word_to_idx  ->  key_id: dict[str,int]
-  +-- val_trie.to_dict()        O(M) pop of _word_to_idx  ->  val_id: dict[str,int]
+  +-- val_id = key_id if shared, else val_trie.to_dict()
   |
   +-- BFS over data             emit child_count + elbl + vcol
         _key_order_cache         frozenset-keyed, amortises sort + key_id lookup
@@ -130,26 +133,32 @@ from_dict(data, *, vocabulary_size=0)
 
 All vocabulary lookups during BFS encoding are O(1) plain-dict hits.
 
-## Binary format (v5)
+## Binary format (v6)
 
 ```
 Magic   : 5 bytes    "CTree"
-Version : 8 bytes    uint64 LE  (always 5)
-Header  : 7 × 8 bytes  lengths of: keys_trie, val_trie, child_count,
-                         vcol, elbl, key_vocab_size, val_vocab_size
-Payload : keys_trie_bytes | val_trie_bytes | child_count_bytes
-          | vcol_bytes | elbl_bytes
+Version : 8 bytes    uint64 LE  (always 6)
+Header  : 8 × 8 bytes  shared_flag, keys_trie_len, val_trie_len, child_count_len,
+                         vcol_len, elbl_len, key_vocab_size, val_vocab_size
+Payload : keys_trie_bytes | val_trie_bytes (empty when shared)
+          | child_count_bytes | vcol_bytes | elbl_bytes
 ```
+
+`shared_flag` is `1` when the tree was built with `shared_trie=True` (a single
+`MarisaTrie` covers all keys and values); `0` for separate tries (classic behaviour).
+When `shared_flag=1`, `val_trie_len=0` and no value-trie blob is written; on load,
+both `_key_trie` and `_val_trie` are set to the same deserialized object.
 
 `key_vocab_size` and `val_vocab_size` are the effective `lru_cache(maxsize=…)` values
 used for the key and value `MarisaTrie` instances respectively. They are set during
 `from_dict` from the `vocabulary_size` argument (`0` = disabled, default; `None` =
-auto-sizes to `len(all_keys)` / `len(unique_values)`; positive int = explicit cap)
-and restored on every load so that query-time caches are immediately correctly sized.
+auto-sizes to `len(all_keys)` / `len(unique_values)` or `len(combined)` when shared;
+positive int = explicit cap) and restored on every load so that query-time caches
+are immediately correctly sized.
 
 `keys_trie_bytes` and `val_trie_bytes` are serialised `MarisaTrie` instances (CSR
 format, v2). `child_count_bytes`, `vcol_bytes`, and `elbl_bytes` are packed uint32
-arrays. Files written in v4 or earlier (LOUDS-based) are not supported.
+arrays. Files written in v5 or earlier are not supported.
 
 ## Usage
 
@@ -175,8 +184,11 @@ tree.serialize("tree.ctree")
 tree2 = CompactTree("tree.ctree")
 
 # Gzip compression
-tree.serialize("tree.ctree.gz", storage_options={"compression": "gzip"})
-tree3 = CompactTree("tree.ctree.gz", storage_options={"compression": "gzip"})
+tree.serialize("tree.ctree.gz", compression="gzip")
+tree3 = CompactTree("tree.ctree.gz", compression="gzip")
+
+# Shared trie (keys and values share one MarisaTrie)
+tree4_shared = CompactTree.from_dict({"a": "b", "b": "a"}, shared_trie=True)
 
 # Pickle support
 import pickle

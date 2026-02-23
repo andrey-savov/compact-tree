@@ -68,8 +68,11 @@ tree.serialize("tree.ctree")
 loaded_tree = CompactTree("tree.ctree")
 
 # Serialize with gzip compression
-tree.serialize("tree.ctree.gz", storage_options={"compression": "gzip"})
-loaded_gz = CompactTree("tree.ctree.gz", storage_options={"compression": "gzip"})
+tree.serialize("tree.ctree.gz", compression="gzip")
+loaded_gz = CompactTree("tree.ctree.gz", compression="gzip")
+
+# Shared trie: keys and values share one MarisaTrie (saves memory when vocabularies overlap)
+tree_shared = CompactTree.from_dict({"a": "b", "b": "a"}, shared_trie=True)
 
 # Pickle support
 import pickle
