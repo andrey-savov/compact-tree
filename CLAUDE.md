@@ -202,6 +202,94 @@ tree.to_dict()
 tree.get_path("a", "x")   # equivalent to tree["a"]["x"]
 ```
 
+---
+
+## CompactTreeFlat
+
+`CompactTreeFlat` (`compact_tree_flat.py`) is a sibling class that discards
+the nested-dict structure entirely and stores all leaf values in a flat
+`dict[tuple[str, ...], int]` mapping full path tuples to val-trie ids.  The
+only lookup interface is `get_path(*keys)`.  No intermediate `_Node` proxies
+are returned; there is no key trie; and the C extension (`TreeIndex`) is not
+used.
+
+### When to use
+
+Use `CompactTreeFlat` when:
+
+- The caller always knows the **full path depth** at call time.
+- Intermediate navigation (`tree["a"]["b"]`) is not required.
+- Only leaf-value deduplication (via `MarisaTrie`) is desired; key storage
+  can remain a plain Python `dict`.
+
+`CompactTreeFlat` is **mutually exclusive** with `shared_trie` (there is no
+key trie to share).
+
+### Internal layout
+
+```
+CompactTreeFlat
+  +-- _key_dict      : dict[tuple[str, ...], int]  full path → val_id
+  +-- _val_trie      : MarisaTrie                  value vocabulary
+  +-- _val_vocab_size: int                          lru_cache size hint
+```
+
+No CSR arrays, no `elbl`/`vcol`, no `_c_tree`.
+
+### from_dict build pipeline
+
+```
+from_dict(data, *, vocabulary_size=0)
+  |
+  +-- _walk_flat()         collect (path_tuple, leaf_str) pairs + unique_values
+  |
+  +-- MarisaTrie(unique_values, cache_size=...)   build value trie
+  |
+  +-- val_trie.to_dict()   O(N) pop of _word_to_idx  ->  val_id: dict[str,int]
+  |
+  +-- _key_dict = {path: val_id[leaf] for path, leaf in pairs}
+```
+
+### Binary format CTFlt v1
+
+```
+Magic   : 5 bytes    "CTFlt"
+Version : 8 bytes    uint64 LE  (always 1)
+Header  : 4 × 8 bytes  n_paths, val_trie_len, paths_buf_len, val_vocab_size
+Payload : val_trie_bytes
+          | paths_buf:
+              for each path (sorted):
+                  uint8  n_components
+                  n × (uint32 LE comp_len + UTF-8 bytes)
+                  uint32 LE  val_id
+```
+
+### Usage
+
+```python
+from compact_tree_flat import CompactTreeFlat
+
+d = {"a": {"x": "1"}, "b": {"x": "2", "y": "3"}}
+tree = CompactTreeFlat.from_dict(d)
+
+tree.get_path("a", "x")          # "1"
+tree.get_path("b", "y")          # "3"
+("b", "x") in tree               # True
+len(tree)                         # 3
+tree.to_dict()                   # {"a": {"x": "1"}, "b": {"x": "2", "y": "3"}}
+
+tree.serialize("tree.ctflat")
+tree2 = CompactTreeFlat("tree.ctflat")
+
+tree.serialize("tree.ctflat.gz", compression="gzip")
+tree3 = CompactTreeFlat("tree.ctflat.gz", compression="gzip")
+
+import pickle
+tree4 = pickle.loads(pickle.dumps(tree))
+```
+
+---
+
 ## Dependencies
 
 - `bitarray` -- bit-packed boolean arrays (terminal flags in MarisaTrie serialization)

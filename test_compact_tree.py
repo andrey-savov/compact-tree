@@ -1,3 +1,4 @@
+import pickle
 import re
 import struct
 import tempfile
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from compact_tree import CompactTree
+from compact_tree_flat import CompactTreeFlat
 
 
 
@@ -1224,6 +1226,167 @@ class TestSharedTrie:
         ct = CompactTree.from_dict(d, shared_trie=True, vocabulary_size=10)
         assert ct._shared_trie is True
         assert ct.to_dict() == d
+
+
+class TestCompactTreeFlat:
+    """Tests for the CompactTreeFlat class."""
+
+    _SAMPLE: dict = {"a": {"x": "1", "y": "2"}, "b": {"x": "3"}}
+
+    def test_get_path_basic(self):
+        """get_path returns correct leaf values."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert tree.get_path("a", "x") == "1"
+        assert tree.get_path("a", "y") == "2"
+        assert tree.get_path("b", "x") == "3"
+
+    def test_get_path_miss(self):
+        """get_path raises KeyError on missing path."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with pytest.raises(KeyError):
+            tree.get_path("a", "z")
+        with pytest.raises(KeyError):
+            tree.get_path("c", "x")
+
+    def test_get_path_no_keys_raises(self):
+        """get_path() with no args raises TypeError."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with pytest.raises(TypeError):
+            tree.get_path()
+
+    def test_contains_tuple(self):
+        """__contains__ works with full tuple paths."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert ("a", "x") in tree
+        assert ("b", "x") in tree
+        assert ("a", "z") not in tree
+        assert ("c",) not in tree
+
+    def test_len(self):
+        """__len__ returns total number of leaf paths."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert len(tree) == 3
+
+    def test_to_dict_roundtrip(self):
+        """to_dict() reconstructs the original nested dict."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        assert tree.to_dict() == self._SAMPLE
+
+    def test_to_dict_flat(self):
+        """to_dict() works on a flat (1-level) dict."""
+        d = {"a": "1", "b": "2", "c": "3"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert tree.to_dict() == d
+
+    def test_empty_dict(self):
+        """from_dict with empty dict produces empty tree."""
+        tree = CompactTreeFlat.from_dict({})
+        assert len(tree) == 0
+        assert tree.to_dict() == {}
+
+    def test_serialize_roundtrip(self):
+        """serialize() + CompactTreeFlat(path) roundtrip."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctflat") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname)
+            tree2 = CompactTreeFlat(fname)
+            assert tree2.to_dict() == self._SAMPLE
+            assert len(tree2) == 3
+        finally:
+            Path(fname).unlink()
+
+    def test_serialize_gzip_roundtrip(self):
+        """gzip serialize/deserialize roundtrip."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctflat.gz") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname, compression="gzip")
+            tree2 = CompactTreeFlat(fname, compression="gzip")
+            assert tree2.to_dict() == self._SAMPLE
+        finally:
+            Path(fname).unlink()
+
+    def test_pickle_roundtrip(self):
+        """Pickle and unpickle preserves all data."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE)
+        data = pickle.dumps(tree)
+        tree2 = pickle.loads(data)
+        assert tree2.to_dict() == self._SAMPLE
+        assert len(tree2) == 3
+        assert tree2.get_path("a", "y") == "2"
+
+    def test_vocabulary_size_kwarg(self):
+        """vocabulary_size kwarg is accepted and stored."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=10)
+        assert tree._val_vocab_size == 10
+        assert tree.to_dict() == self._SAMPLE
+
+    def test_vocabulary_size_none(self):
+        """vocabulary_size=None auto-sizes cache."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=None)
+        assert tree._val_vocab_size == len({"1", "2", "3"})
+        assert tree.to_dict() == self._SAMPLE
+
+    def test_vocabulary_size_invalid_type(self):
+        """vocabulary_size with invalid type raises TypeError."""
+        with pytest.raises(TypeError, match="vocabulary_size must be an int"):
+            CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size="big")  # type: ignore[arg-type]
+
+    def test_vocabulary_size_negative(self):
+        """vocabulary_size negative raises ValueError."""
+        with pytest.raises(ValueError):
+            CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=-1)
+
+    def test_deep_nesting(self):
+        """Works with 4-level deep nesting."""
+        d = {"a": {"b": {"c": {"d": "leaf"}}}}
+        tree = CompactTreeFlat.from_dict(d)
+        assert tree.get_path("a", "b", "c", "d") == "leaf"
+        assert len(tree) == 1
+        assert tree.to_dict() == d
+
+    def test_non_string_values_coerced(self):
+        """Non-string leaf values are coerced to str."""
+        d = {"a": {"x": 42, "y": 3.14}}  # type: ignore[dict-item]
+        tree = CompactTreeFlat.from_dict(d)
+        assert tree.get_path("a", "x") == "42"
+        assert tree.get_path("a", "y") == "3.14"
+
+    def test_repr(self):
+        """__repr__ returns a round-trippable string."""
+        d = {"x": "1"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert repr(tree) == f"CompactTreeFlat.from_dict({d!r})"
+
+    def test_str(self):
+        """__str__ returns the nested dict string."""
+        d = {"x": "1"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert str(tree) == str(d)
+
+    def test_overlapping_values(self):
+        """Repeated leaf values are deduplicated in _val_trie."""
+        d = {"a": "same", "b": "same", "c": "other"}
+        tree = CompactTreeFlat.from_dict(d)
+        assert len(tree._val_trie) == 2  # only 2 unique values
+        assert tree.get_path("a") == "same"
+        assert tree.get_path("b") == "same"
+        assert tree.get_path("c") == "other"
+
+    def test_serialize_vocab_size_preserved(self):
+        """vocabulary_size is preserved across serialize/deserialize."""
+        tree = CompactTreeFlat.from_dict(self._SAMPLE, vocabulary_size=5)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ctflat") as f:
+            fname = f.name
+        try:
+            tree.serialize(fname)
+            tree2 = CompactTreeFlat(fname)
+            assert tree2._val_vocab_size == 5
+        finally:
+            Path(fname).unlink()
 
 
 if __name__ == "__main__":

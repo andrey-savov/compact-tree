@@ -1,33 +1,51 @@
 # CompactTree Benchmark Results
 
-**Machine**: ultra  
-**Python**: 3.13.12  
-**Date**: 2026-02-15
+## Latest Benchmark Results — v3.0.0 (2026-02-22)
 
-## Latest Benchmark Results (After All Optimizations)
+**Machine**: Windows 11, Intel Core Ultra 9 285H  
+**Python**: 3.14.3 (CPython, MSC v.1944 64-bit)  
+**C extension**: `_marisa_ext` compiled (`TrieIndex` + `TreeIndex`)  
+**Date**: 2026-02-22
+
+```
+pytest test_compact_tree.py::TestLoadPerformance --benchmark-only -v
+```
 
 | Test | Min | Max | Mean | StdDev | Rounds | Unit |
 |------|-----|-----|------|--------|--------|------|
-| **build_compact_tree_from_cooccurrence** | **26.22** | **33.99** | **28.89** | 1.31 | 31 | **ms** |
+| **test_build_compact_tree_from_cooccurrence** | **15.48** | **24.58** | **17.31** | 1.65 | 57 | **ms** |
+| test_tree_lookups_at_different_depths | 0.88 | 53.68 | 1.02 | 0.49 | 192,308 | μs |
+| test_serialization_performance | 343.30 | 1,157.50 | 426.84 | 136.63 | 80 | μs |
+| test_deserialization_performance | 1,739.80 | 7,027.80 | 2,204.95 | 855.77 | 37 | μs |
+
+### Performance Summary
+
+**Build time** (37K-entry co-occurrence dict): **17.31 ms mean** (57.77 builds/s)  
+**Lookup throughput**: **984,873 /s** (1.02 µs/lookup) — C extension active  
+**Serialization**: **2,343 /s** (426.84 µs/op)  
+**Deserialization**: **454 /s** (2,204.95 µs/op)
+
+**Key Metrics:**
+- **37,019 total entries** in co-occurrence dictionary
+- **~985K lookups/s** with C extension (`TreeIndex`)
+- ~17ms build time (down from ~29ms in v2.0.0 baseline due to C extension navigation)
+
+---
+
+## Historical Benchmark Results
+
+### v2.1.0 (2026-02-21) — Python 3.13, pure-Python fallback (no C extension)
+
+| Test | Min | Max | Mean | StdDev | Rounds | Unit |
+|------|-----|-----|------|--------|--------|------|
+| build_compact_tree_from_cooccurrence | 26.22 | 33.99 | 28.89 | 1.31 | 31 | ms |
 | tree_lookups_at_different_depths | 4.60 | 197.70 | 5.45 | 2.68 | 136,987 | μs |
 | serialization_performance | 258.70 | 6,691.90 | 332.35 | 196.83 | 1,155 | μs |
 | deserialization_performance | 1,298.10 | 2,548.70 | 1,493.41 | 281.69 | 45 | μs |
 
-### Performance Summary
+### Pre-v1.2.0 Optimization History
 
-**Build Time:**
-- Original (baseline): 5,340ms
-- After optimizations #1-3: 2,400ms (2.2x faster)
-- **After LRU cache (opt #4): 29ms (183x faster overall!)**
-
-**Key Metrics:**
-- **37,019 total entries** in co-occurrence dictionary
-- **99.91% cache hit rate** (75,019 / 75,083 lookups)
-- **Only 64 actual trie traversals** (vs 75,083 before cache)
-
-## Optimization History
-
-### Optimization #4: LRU Cache (2026-02-15)
+#### Optimization #4: LRU Cache (2026-02-15)
 - **Speedup:** 2,400ms → 29ms (84x improvement)
 - **Implementation:** Instance-level OrderedDict cache with 4,096 entry limit
 - **Impact:** Eliminates redundant trie traversals for repeated keys
@@ -46,7 +64,7 @@
 
 ## Historical Benchmark Results
 
-### Before Optimizations (Baseline)
+#### Before Optimizations (v1.1.0 baseline, 2026-02-15)
 
 | Test | Min (ms) | Max (ms) | Mean (ms) | StdDev | Rounds |
 |------|----------|----------|-----------|--------|--------|

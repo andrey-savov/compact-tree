@@ -60,6 +60,8 @@ three PyArrow table layouts.
 | Target | Lookups / s | µs / lookup | vs dict |
 |---|---|---|---|
 | `dict[k0][k1][k2]` | 235,958 | 4.2 | 1.0× (baseline) |
+| `CompactTreeFlat.get_path()` † | 194,220 | 5.1 | 0.85× †|
+| `CompactTree.get_path()` (C extension) † | 141,224 | 7.1 | 0.62× †|
 | `CompactTree[k0][k1][k2]` (no LRU cache, default) | 124,384 | 8.0 | 0.53× |
 | `CompactTree[k0][k1][k2]` (no LRU cache, `shared_trie=True`) | 123,573 | 8.1 | 0.52× |
 | `CompactTree[k0][k1][k2]` (LRU cache, `vocabulary_size=None`) | 116,589 | 8.6 | 0.49× |
@@ -100,6 +102,13 @@ three PyArrow table layouts.
   the C-level `TreeIndex.get` traversal, which is unchanged. The benefit is
   lower memory usage when key and value vocabularies overlap significantly;
   pass `shared_trie=True` to `from_dict()` to enable it.
+* **`CompactTreeFlat.get_path()`** (†) is measured via `profile_compact_tree_flat.py`
+  using its own timed loop (10 s, same L2=173,000 dataset, 10% miss ratio).
+  The vs-dict ratios for the `†` rows use the dict baseline from that same
+  run (228,998 /s, 4.4 µs) rather than the 235,958 /s figure above.
+  `CompactTreeFlat` is ~38% faster than `CompactTree.get_path()` because a
+  full-path lookup reduces to a single Python `dict.__getitem__` call plus one
+  `MarisaTrie.restore_key()` call, with no CSR trie traversal.
 * **PyArrow flat filter** and **nested map** are O(N) scans over all 173K rows
   per lookup — roughly 1,500–3,500× slower than the indexed approaches. They
   are included for completeness, not as practical lookup strategies.
@@ -128,6 +137,7 @@ loop). Representative wall times at L2 = 173,000:
 
 ```bash
 # Lookup benchmarks (10 s each)
+python profile_compact_tree_flat.py --mode both --compare --use-dict --lookup-duration 10          # CompactTreeFlat vs CompactTree.get_path() vs dict
 python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10                         # no LRU cache (default)
 python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --shared-trie           # shared trie, no LRU cache
 python profile_synthetic.py --mode lookup --l2 173000 --lookup-duration 10 --vocab-size None       # LRU cache, auto-sized

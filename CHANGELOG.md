@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-02-22
+
 ### Added
 
+- **`CompactTreeFlat`** (new module `compact_tree_flat.py`) — flat tuple-keyed store
+  backed by a single value `MarisaTrie`.  Unlike `CompactTree`, it discards the
+  nested-dict structure and stores every leaf as a `tuple[str, …] → val_id` mapping.
+  The only lookup interface is `get_path(*keys)`, which takes all path components
+  at once and returns the leaf value directly with no intermediate `_Node` objects.
+  Supports `__contains__`, `__len__`, `to_dict()`, `serialize()`, gzip compression,
+  and pickle.  Binary format: `CTFlt v1`.
+  **Lookup performance** (Windows, L2=173 K, 10 s): 194 K /s (5.1 µs), versus
+  141 K /s (7.1 µs) for `CompactTree.get_path()` — **~38% faster** because a
+  full-path lookup reduces to one Python `dict.__getitem__` + one `restore_key` call.
 - `CompactTree.from_dict(…, shared_trie=True)` — build a single `MarisaTrie` from
   the union of all keys and leaf values.  Strings that appear as both a key and a
   value are stored only once, reducing memory when the key/value vocabularies overlap.
@@ -235,7 +247,8 @@ Benchmark: 3-level nested dict, shape `{L0=9, L1=4, L2=173,000}`, 6.2M leaf entr
 - succinct >= 0.0.7
 - fsspec >= 2021.0.0
 
-[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/andrey-savov/compact-tree/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/andrey-savov/compact-tree/compare/v2.1.1...v3.0.0
 [2.1.1]: https://github.com/andrey-savov/compact-tree/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/andrey-savov/compact-tree/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/andrey-savov/compact-tree/compare/v1.2.1...v2.0.0
