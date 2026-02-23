@@ -1138,9 +1138,6 @@ class TestSharedTrie:
 
     def test_shared_trie_serialize_roundtrip(self):
         """Serialize and deserialize a shared-trie tree."""
-        import tempfile
-        from pathlib import Path
-
         d = {"a": "b", "b": "a", "c": "d"}
         ct = CompactTree.from_dict(d, shared_trie=True)
 
@@ -1157,9 +1154,6 @@ class TestSharedTrie:
 
     def test_separate_trie_serialize_roundtrip(self):
         """Serialize and deserialize a separate-trie tree (default)."""
-        import tempfile
-        from pathlib import Path
-
         d = {"a": "1", "b": "2"}
         ct = CompactTree.from_dict(d)
 
@@ -1176,8 +1170,6 @@ class TestSharedTrie:
 
     def test_shared_trie_pickle_roundtrip(self):
         """Pickle and unpickle a shared-trie tree."""
-        import pickle
-
         d = {"a": "b", "b": "a", "c": "d"}
         ct = CompactTree.from_dict(d, shared_trie=True)
 
@@ -1190,9 +1182,6 @@ class TestSharedTrie:
 
     def test_shared_trie_gzip_roundtrip(self):
         """Gzip serialize/deserialize with shared_trie=True."""
-        import tempfile
-        from pathlib import Path
-
         d = {"a": "b", "c": "d"}
         ct = CompactTree.from_dict(d, shared_trie=True)
 
